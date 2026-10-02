@@ -413,61 +413,37 @@ async def add_metadata(
         ]
         strategies: list = []
 
-        # Safety check: if test-mux excluded ALL video streams, the ffmpeg
-        # binary cannot handle this file's video codec (e.g. old Heroku ffmpeg
-        # that can't mux HEVC into MKV via temp file). In that case strategy 1
-        # would produce a video-less output — which is worse than failing.
-        # Skip it entirely and let mkvpropedit/mutagen handle it instead.
-        _safe_has_video = any(
-            s.get("codec_type") == "video"
-            for s in _streams
-            if s["index"] in _safe_indices
-        )
-        _all_has_video = any(
-            s.get("codec_type") == "video"
-            for s in _streams
-        )
-        _strategy1_safe = (not _all_has_video) or _safe_has_video
+        # ── Strategy ordering: safe, lossless methods first ──────────────────
+        # mkvpropedit edits tags IN-PLACE (file copy then tag patch) — it never
+        # touches streams so it cannot drop a single track.  mutagen is the same.
+        # FFmpeg remux is only used as a last resort because it re-muxes all
+        # streams and the test-mux logic can incorrectly exclude the main video
+        # track (e.g. HEVC on older ffmpeg builds), producing a shrunken output.
 
-        if _has_unsafe_streams and _safe_indices and _strategy1_safe:
-            # Strategy 1: Map only streams confirmed writable by test-mux.
-            # These indices are empirically verified — no guessing from
-            # codec_type or codec_name which are unreliable for anime MKVs.
-            _explicit_maps: list[str] = []
-            for idx in _safe_indices:
-                _explicit_maps += ["-map", f"0:{idx}"]
-            strategies.append(
-                _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
-                + meta_args + [output_path]
-            )
-        elif _has_unsafe_streams and not _strategy1_safe:
-            log.warning(
-                "[add_metadata] test-mux excluded all video streams — "
-                "ffmpeg binary too old for this codec. Skipping strategy 1, "
-                "falling through to mkvpropedit. Fix: ensure build.sh runs "
-                "on deploy so ./bin/ffmpeg (static) is used instead of the "
-                "system ffmpeg.",
-            )
-            # Strategy 2: mkvpropedit — zero-remux, cannot produce exit 183.
+        # Strategy 1: mkvpropedit — zero-remux, in-place tag edit (MKV only).
+        if _input_ext == ".mkv":
             strategies.append({
                 "type": "mkvpropedit",
                 "binary": _find_binary("mkvpropedit"),
                 "input": input_path, "output": output_path,
                 "fields": metadata_fields,
             })
-            # Strategy 3: mutagen — pure Python, no binary dependency.
-            strategies.append({
-                "type": "mutagen",
-                "input": input_path, "output": output_path,
-                "fields": metadata_fields,
-            })
 
-        # Strategy 4: plain map-all (for files without unsafe streams)
+        # Strategy 2: mutagen — pure Python, in-place, no binary dependency.
+        strategies.append({
+            "type": "mutagen",
+            "input": input_path, "output": output_path,
+            "fields": metadata_fields,
+        })
+
+        # Strategy 3: FFmpeg with -map 0 (ALL streams, no exclusions).
+        # Never uses selective stream mapping so no tracks can be dropped.
         strategies.append(
             _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
             + meta_args + [output_path]
         )
-        # Strategy 5: bare stream copy (last resort)
+
+        # Strategy 4: bare stream copy (absolute last resort)
         strategies.append(_base + ["-c", "copy"] + meta_args + [output_path])
 
         # ── 4. Execute strategies in order ────────────────────────────────────
