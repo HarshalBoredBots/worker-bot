@@ -269,43 +269,149 @@ async def add_metadata(
         if sub_title:
             meta_args += ["-metadata:s:s", f"title={sub_title}"]
 
-        # ── 3. Build strategies ────────────────────────────────────────────────
+        # ── 3. Strategy: mkvpropedit in-place (MKV only) ─────────────────────
+        # mkvpropedit edits tags DIRECTLY in the MKV file without touching
+        # any streams. It never remuxes, so broken attachment streams
+        # (font/sfnt with unknown codec params) are completely irrelevant.
+        # This is the ONLY 100% reliable approach for these anime MKVs.
+        #
+        # For non-MKV files we fall back to FFmpeg remux with explicit
+        # stream index mapping.
+
+        _input_ext = os.path.splitext(input_path)[1].lower()
+
+        if _input_ext == ".mkv":
+            # ── mkvpropedit path ──────────────────────────────────────────────
+            _mkvpropedit = _find_binary("mkvpropedit")
+            if _mkvpropedit and os.path.isfile(_mkvpropedit):
+                # mkvpropedit edits the INPUT file in-place.
+                # We copy input → output first, then edit output in-place.
+                import shutil as _shutil
+                try:
+                    _shutil.copy2(input_path, output_path)
+                except Exception as _ce:
+                    log.warning("[add_metadata] copy for mkvpropedit failed: {err}", err=_ce)
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    # Build mkvpropedit command
+                    # --tags all: clears existing tags, --add-track-statistics-tags: optional
+                    mkv_cmd = [_mkvpropedit, output_path, "--tags", "all:"]
+
+                    # Global tags via XML (mkvpropedit needs XML format for tags)
+                    # Build a minimal tag XML
+                    _tag_lines = []
+                    _TITLE_TAG = (metadata_fields.get("title") or "").strip()
+                    if _TITLE_TAG:
+                        _tag_lines.append(f'    <Simple><Name>TITLE</Name><String>{_TITLE_TAG}</String></Simple>')
+                    _ARTIST = (metadata_fields.get("artist") or "").strip()
+                    if _ARTIST:
+                        _tag_lines.append(f'    <Simple><Name>ARTIST</Name><String>{_ARTIST}</String></Simple>')
+                    _AUTHOR = (metadata_fields.get("author") or "").strip()
+                    if _AUTHOR:
+                        _tag_lines.append(f'    <Simple><Name>AUTHOR</Name><String>{_AUTHOR}</String></Simple>')
+                    _COMMENT = (metadata_fields.get("comment") or "").strip()
+                    if _COMMENT:
+                        _tag_lines.append(f'    <Simple><Name>COMMENT</Name><String>{_COMMENT}</String></Simple>')
+
+                    if _tag_lines:
+                        import tempfile as _tf
+                        _xml_content = (
+                            '<?xml version="1.0"?>\n'
+                            '<!DOCTYPE Tags SYSTEM "matroskatags.dtd">\n'
+                            '<Tags>\n'
+                            '  <Tag>\n'
+                            '    <Targets/>\n'
+                            + "\n".join(_tag_lines) + "\n"
+                            '  </Tag>\n'
+                            '</Tags>\n'
+                        )
+                        _xml_fd, _xml_path = _tf.mkstemp(suffix=".xml")
+                        try:
+                            with os.fdopen(_xml_fd, "w") as _xf:
+                                _xf.write(_xml_content)
+                            mkv_cmd += ["--tags", f"all:{_xml_path}"]
+
+                            # Track title tags
+                            _audio_title = (metadata_fields.get("audio") or "").strip()
+                            _video_title = (metadata_fields.get("video") or "").strip()
+                            _sub_title   = (metadata_fields.get("subtitle") or "").strip()
+                            if _audio_title:
+                                mkv_cmd += ["--edit", "track:a1", "--set", f"name={_audio_title}"]
+                            if _video_title:
+                                mkv_cmd += ["--edit", "track:v1", "--set", f"name={_video_title}"]
+                            if _sub_title:
+                                mkv_cmd += ["--edit", "track:s1", "--set", f"name={_sub_title}"]
+
+                            log.debug(
+                                "[add_metadata] mkvpropedit cmd: {cmd}",
+                                cmd=" ".join(mkv_cmd),
+                            )
+                            _mp = await asyncio.create_subprocess_exec(
+                                *mkv_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            _mp_out, _mp_err = await _mp.communicate()
+                            _mp_stderr = _mp_err.decode(errors="replace").strip()
+
+                            if _mp.returncode == 0:
+                                log.debug("[add_metadata] mkvpropedit succeeded")
+                                await _safe_edit(ms, "✅ Metadata added.")
+                                return output_path
+                            else:
+                                log.warning(
+                                    "[add_metadata] mkvpropedit failed (exit={rc}): {err}",
+                                    rc=_mp.returncode, err=_mp_stderr[-300:],
+                                )
+                                # Fall through to FFmpeg strategies below
+                        finally:
+                            try:
+                                os.unlink(_xml_path)
+                            except Exception:
+                                pass
+                    else:
+                        # No tags to write — just copy and return
+                        await _safe_edit(ms, "✅ Metadata added.")
+                        return output_path
+            else:
+                log.warning("[add_metadata] mkvpropedit not found — using FFmpeg fallback")
+
+        # ── 4. FFmpeg fallback (non-MKV or mkvpropedit failed) ───────────────
+
+        _ffmpeg = _find_binary("ffmpeg")
         _base = [
-            "ffmpeg", "-y",
-            "-probesize", "100M",
-            "-analyzeduration", "100M",
-            "-threads", "1",
-            "-i", input_path,
+            _ffmpeg, "-y",
+            "-probesize", "100M", "-analyzeduration", "100M",
+            "-threads", "1", "-i", input_path,
         ]
 
-        strategies: list[list[str]] = []
+        ffmpeg_strategies: list[list[str]] = []
 
-        # Strategy A: explicit per-index map (skips fonts/attachments entirely)
-        # This is the primary strategy and handles all anime MKVs with fonts.
+        # Strategy A: explicit per-index map (excludes all bad streams)
         if probe_ok and good_indices:
             _map_args: list[str] = []
             for idx in good_indices:
                 _map_args += ["-map", f"0:{idx}"]
-            strategies.append(
+            ffmpeg_strategies.append(
                 _base + _map_args + ["-c", "copy"]
                 + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
             )
 
-        # Strategy B: specifier map (fallback if probe failed)
-        strategies.append(
-            _base
-            + ["-map", "0:V?", "-map", "0:a?", "-map", "0:s?"]
-            + ["-c", "copy"]
-            + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
+        # Strategy B: specifier map
+        ffmpeg_strategies.append(
+            _base + ["-map", "0:V?", "-map", "0:a?", "-map", "0:s?"]
+            + ["-c", "copy"] + meta_args
+            + ["-progress", "pipe:1", "-nostats", output_path]
         )
 
-        # Strategy C: last resort — map all + ignore unknown
-        strategies.append(
+        # Strategy C: map all + ignore_unknown
+        ffmpeg_strategies.append(
             _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
             + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
         )
 
-        # ── 4. Try each strategy with progress bar ─────────────────────────────
         file_size  = os.path.getsize(input_path)
         start_time = time.time()
         last_edit  = 0.0
@@ -350,7 +456,7 @@ async def add_metadata(
         stderr_txt = ""
         success = False
 
-        for attempt, cmd in enumerate(strategies, 1):
+        for attempt, cmd in enumerate(ffmpeg_strategies, 1):
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
@@ -358,9 +464,8 @@ async def add_metadata(
                     pass
 
             log.debug(
-                "[add_metadata] strategy {n}/{t}: {cmd}",
-                n=attempt, t=len(strategies),
-                cmd=" ".join(cmd),
+                "[add_metadata] ffmpeg strategy {n}/{t}: {cmd}",
+                n=attempt, t=len(ffmpeg_strategies), cmd=" ".join(cmd),
             )
 
             proc = await asyncio.create_subprocess_exec(
@@ -368,15 +473,12 @@ async def add_metadata(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-
-            # Drain stdout (progress) and stderr concurrently
             _, stderr_bytes = await asyncio.gather(
                 _drain_progress(proc.stdout),
                 proc.stderr.read(),
             )
             await proc.wait()
             stderr_txt = stderr_bytes.decode(errors="replace").strip()
-
             if stderr_txt:
                 log.debug(Msg.META_FFMPEG_STDERR, stderr=stderr_txt[-600:])
 
@@ -385,7 +487,7 @@ async def add_metadata(
                 and os.path.exists(output_path)
                 and os.path.getsize(output_path) > 0
             ):
-                log.debug("[add_metadata] strategy {n} succeeded", n=attempt)
+                log.debug("[add_metadata] ffmpeg strategy {n} succeeded", n=attempt)
                 success = True
                 break
 

@@ -127,6 +127,80 @@ def _bootstrap_ffmpeg() -> None:
 
 _bootstrap_ffmpeg()
 
+
+def _bootstrap_mkvtoolnix() -> None:
+    """
+    Download a static mkvpropedit binary at dyno startup.
+    mkvpropedit edits MKV tags IN-PLACE without remuxing any streams —
+    this is the only reliable way to add metadata to MKVs that have
+    broken attachment streams (font/sfnt) that cause FFmpeg exit 183.
+    """
+    import os
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+    mkvpropedit_path = os.path.join(bin_dir, "mkvpropedit")
+
+    if os.path.isfile(mkvpropedit_path) and os.access(mkvpropedit_path, os.X_OK):
+        print(f"[bootstrap] mkvpropedit already present at {mkvpropedit_path}", flush=True)
+        return
+
+    os.makedirs(bin_dir, exist_ok=True)
+
+    # Static mkvtoolnix builds from mkvtoolnix.download
+    URLS = [
+        "https://mkvtoolnix.download/appimage/MKVToolNix_GUI-88.0-x86_64.AppImage",
+    ]
+
+    # AppImage approach won't work on Heroku (no FUSE).
+    # Use the static build from official releases instead.
+    STATIC_URLS = [
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-88.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-86.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-84.0.tar.xz",
+    ]
+
+    for url in STATIC_URLS:
+        try:
+            print(f"[bootstrap] Downloading mkvtoolnix from {url} ...", flush=True)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.xz")
+            tmp.close()
+            urllib.request.urlretrieve(url, tmp.name)
+            with open(tmp.name, "rb") as f:
+                magic = f.read(6)
+            if magic[:6] != b"\xfd7zXZ\x00":
+                print(f"[bootstrap] mkvtoolnix download not valid xz, skipping.", flush=True)
+                os.unlink(tmp.name)
+                continue
+            print(f"[bootstrap] mkvtoolnix download OK ({os.path.getsize(tmp.name)} bytes)", flush=True)
+            with tarfile.open(tmp.name, "r:xz") as tar:
+                for member in tar.getmembers():
+                    if os.path.basename(member.name) == "mkvpropedit" and member.isfile():
+                        with tar.extractfile(member) as src, open(mkvpropedit_path, "wb") as dst:
+                            dst.write(src.read())
+                        os.chmod(mkvpropedit_path, 0o755)
+                        print(f"[bootstrap] Extracted mkvpropedit → {mkvpropedit_path}", flush=True)
+                        break
+            os.unlink(tmp.name)
+            if os.path.isfile(mkvpropedit_path):
+                break
+        except Exception as exc:
+            print(f"[bootstrap] mkvtoolnix download failed: {exc}", flush=True)
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+    if not os.path.isfile(mkvpropedit_path):
+        print("[bootstrap] WARNING: mkvpropedit not available — FFmpeg fallback will be used.", flush=True)
+    else:
+        print(f"[bootstrap] mkvpropedit ready at {mkvpropedit_path}", flush=True)
+
+
+_bootstrap_mkvtoolnix()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
