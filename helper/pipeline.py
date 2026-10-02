@@ -129,7 +129,17 @@ class JobPipeline:
         rename_pattern    = task.get("rename_pattern", "")
         prefix            = task.get("prefix", "")
         suffix            = task.get("suffix", "")
-        metadata          = task.get("metadata") or {}
+        # Hardcoded metadata — always embed @Animes_Ocean regardless of
+        # whatever the manager bot sends. Cannot be changed by any command.
+        metadata = {
+            "title":    "@Animes_Ocean",
+            "artist":   "@Animes_Ocean",
+            "author":   "@Animes_Ocean",
+            "comment":  "@Animes_Ocean",
+            "audio":    "@Animes_Ocean",
+            "video":    "@Animes_Ocean",
+            "subtitle": "@Animes_Ocean",
+        }
         thumbnail_url     = task.get("thumbnail_url")
 
         download_path: Optional[str] = None

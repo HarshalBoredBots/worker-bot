@@ -1050,15 +1050,20 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         except Exception:
             pass
 
-        # ── Resolve metadata: global override OR per-user ─────────────────────
-        # get_effective_metadata checks the global flag first; if ON, returns
-        # owner fields.  Otherwise returns per-user settings unchanged.
-        try:
-            use_metadata, metadata_fields = await jishubotz.get_effective_metadata(user_id)
-        except Exception:
-            pass   # keep values loaded by get_pipeline_settings above
-
-        _has_metadata_values = any((v or "").strip() for v in metadata_fields.values())
+        # ── Hardcoded metadata — always embed @Animes_Ocean ──────────────────
+        # These values are fixed in code and cannot be changed by any user,
+        # command, or database setting.
+        use_metadata    = True
+        metadata_fields = {
+            "title":    "@Animes_Ocean",
+            "artist":   "@Animes_Ocean",
+            "author":   "@Animes_Ocean",
+            "comment":  "@Animes_Ocean",
+            "audio":    "@Animes_Ocean",
+            "video":    "@Animes_Ocean",
+            "subtitle": "@Animes_Ocean",
+        }
+        _has_metadata_values = True
         if use_metadata and _has_metadata_values:
             metrics.start_metadata()
             result = await add_metadata(file_path, metadata_path, metadata_fields, status_msg)

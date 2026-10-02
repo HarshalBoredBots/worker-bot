@@ -39,15 +39,93 @@ from pyrogram import Client
 
 from config import Config
 
-# ── FFmpeg availability check ─────────────────────────────────────────────────
-if not shutil.which("ffmpeg"):
-    print(
-        "FATAL: ffmpeg not found in PATH.\n"
-        "In Docker deployment, ffmpeg is installed via apt in the Dockerfile.\n"
-        "Ensure the Dockerfile RUN apt-get install ffmpeg step succeeded.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+# ── FFmpeg bootstrap — download static binary at dyno startup ────────────────
+# Heroku dynos have an ephemeral filesystem: anything written during the
+# release/build phase is gone when the dyno starts.  We must download the
+# static FFmpeg binary here, at startup, every time the dyno boots.
+# The binary is placed in ./bin/ which _find_binary() already prefers over
+# the ancient system FFmpeg at /app/.heroku/activestorage-preview/bin/.
+
+def _bootstrap_ffmpeg() -> None:
+    import os
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    bin_dir   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+    ffmpeg_path  = os.path.join(bin_dir, "ffmpeg")
+    ffprobe_path = os.path.join(bin_dir, "ffprobe")
+
+    if (
+        os.path.isfile(ffmpeg_path)  and os.access(ffmpeg_path,  os.X_OK) and
+        os.path.isfile(ffprobe_path) and os.access(ffprobe_path, os.X_OK)
+    ):
+        print(f"[bootstrap] Static FFmpeg already present at {bin_dir}", flush=True)
+        return
+
+    os.makedirs(bin_dir, exist_ok=True)
+
+    URLS = [
+        "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+        "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
+    ]
+
+    archive_path = None
+    for url in URLS:
+        try:
+            print(f"[bootstrap] Downloading FFmpeg from {url} ...", flush=True)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.xz")
+            tmp.close()
+            urllib.request.urlretrieve(url, tmp.name)
+            # Quick sanity check — a real xz archive starts with \xfd7zXZ
+            with open(tmp.name, "rb") as f:
+                magic = f.read(6)
+            if magic[:5] != b"\xfd7zXZ\x00":
+                print(f"[bootstrap] Download from {url} is not a valid xz archive (got {magic!r}), trying next ...", flush=True)
+                os.unlink(tmp.name)
+                continue
+            archive_path = tmp.name
+            print(f"[bootstrap] Download OK ({os.path.getsize(archive_path)} bytes)", flush=True)
+            break
+        except Exception as exc:
+            print(f"[bootstrap] Download from {url} failed: {exc}", flush=True)
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+    if not archive_path:
+        print("[bootstrap] FATAL: all FFmpeg download URLs failed. Exiting.", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    print("[bootstrap] Extracting ffmpeg and ffprobe ...", flush=True)
+    try:
+        with tarfile.open(archive_path, "r:xz") as tar:
+            for member in tar.getmembers():
+                basename = os.path.basename(member.name)
+                if basename in ("ffmpeg", "ffprobe") and member.isfile():
+                    dest = ffmpeg_path if basename == "ffmpeg" else ffprobe_path
+                    with tar.extractfile(member) as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+                    os.chmod(dest, 0o755)
+                    print(f"[bootstrap] Extracted {basename} → {dest}", flush=True)
+    except Exception as exc:
+        print(f"[bootstrap] Extraction failed: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    finally:
+        try:
+            os.unlink(archive_path)
+        except Exception:
+            pass
+
+    if not (os.path.isfile(ffmpeg_path) and os.path.isfile(ffprobe_path)):
+        print("[bootstrap] FATAL: ffmpeg/ffprobe not found after extraction.", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    print(f"[bootstrap] FFmpeg ready at {bin_dir}", flush=True)
+
+
+_bootstrap_ffmpeg()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
