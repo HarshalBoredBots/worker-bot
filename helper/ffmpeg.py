@@ -316,26 +316,44 @@ async def add_metadata(
                 ]
                 _has_unsafe_streams = len(_all_indices) < len(_streams)
 
-            # Step B: test-mux each candidate index into a Matroska pipe sink.
-            # MUST use "-f matroska" not "-f null": the null muxer skips codec
-            # parameter validation and gives false positives for streams that
-            # the real Matroska muxer will reject with exit 183.
-            # Piping to /dev/null avoids writing any bytes to disk while still
-            # exercising the full MKV container header write path.
+            # Step B: test-mux each candidate index into a real temp MKV file.
+            # WHY a temp file and not pipe:1 or /dev/null:
+            #   - "-f null" skips codec-parameter validation → false positives
+            #   - "pipe:1" causes HEVC/H.265 streams to fail on older ffmpeg
+            #     builds because piped Matroska requires seekable output for
+            #     the cues index; the stream itself is fine but ffmpeg exits
+            #     non-zero, making us incorrectly drop the video track.
+            #   - A real temp file exercises the full header+cues write path
+            #     and gives a definitive result for every codec.
+            # We write only 1 second of data (-t 1) to keep it fast, then
+            # delete the temp file immediately after the test.
+            import tempfile as _tempfile
+            _tmp_dir = os.path.dirname(os.path.abspath(output_path))
+
             async def _test_stream(idx: int) -> bool:
-                _tp = await asyncio.create_subprocess_exec(
-                    _ffmpeg, "-y",
-                    "-probesize", "100M", "-analyzeduration", "100M",
-                    "-i", input_path,
-                    "-map", f"0:{idx}",
-                    "-c", "copy",
-                    "-f", "matroska", "pipe:1",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await _tp.communicate()
-                # exit 0 = muxer accepted codec params; any other = reject
-                return _tp.returncode == 0
+                _tmp = os.path.join(_tmp_dir, f"_testmux_{idx}_{os.getpid()}.mkv")
+                try:
+                    _tp = await asyncio.create_subprocess_exec(
+                        _ffmpeg, "-y",
+                        "-probesize", "100M", "-analyzeduration", "100M",
+                        "-i", input_path,
+                        "-map", f"0:{idx}",
+                        "-t", "1",
+                        "-c", "copy",
+                        "-f", "matroska", _tmp,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await _tp.communicate()
+                    return _tp.returncode == 0 and os.path.exists(_tmp) and os.path.getsize(_tmp) > 0
+                except Exception:
+                    return False
+                finally:
+                    try:
+                        if os.path.exists(_tmp):
+                            os.remove(_tmp)
+                    except Exception:
+                        pass
 
             _test_results = await asyncio.gather(
                 *[_test_stream(i) for i in _all_indices]
