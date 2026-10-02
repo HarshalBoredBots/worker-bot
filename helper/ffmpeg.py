@@ -289,6 +289,7 @@ async def add_metadata(
         _UNWRITABLE_CODECS = {"none", "unknown", ""}
         _safe_indices: list[int] = []
         _has_unsafe_streams = False
+        _streams: list[dict] = []
         try:
             _ffprobe = _find_binary("ffprobe")
             _ffmpeg  = _find_binary("ffmpeg")
@@ -404,7 +405,23 @@ async def add_metadata(
         ]
         strategies: list = []
 
-        if _has_unsafe_streams and _safe_indices:
+        # Safety check: if test-mux excluded ALL video streams, the ffmpeg
+        # binary cannot handle this file's video codec (e.g. old Heroku ffmpeg
+        # that can't mux HEVC into MKV via temp file). In that case strategy 1
+        # would produce a video-less output — which is worse than failing.
+        # Skip it entirely and let mkvpropedit/mutagen handle it instead.
+        _safe_has_video = any(
+            s.get("codec_type") == "video"
+            for s in _streams
+            if s["index"] in _safe_indices
+        )
+        _all_has_video = any(
+            s.get("codec_type") == "video"
+            for s in _streams
+        )
+        _strategy1_safe = (not _all_has_video) or _safe_has_video
+
+        if _has_unsafe_streams and _safe_indices and _strategy1_safe:
             # Strategy 1: Map only streams confirmed writable by test-mux.
             # These indices are empirically verified — no guessing from
             # codec_type or codec_name which are unreliable for anime MKVs.
@@ -414,6 +431,14 @@ async def add_metadata(
             strategies.append(
                 _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
                 + meta_args + [output_path]
+            )
+        elif _has_unsafe_streams and not _strategy1_safe:
+            log.warning(
+                "[add_metadata] test-mux excluded all video streams — "
+                "ffmpeg binary too old for this codec. Skipping strategy 1, "
+                "falling through to mkvpropedit. Fix: ensure build.sh runs "
+                "on deploy so ./bin/ffmpeg (static) is used instead of the "
+                "system ffmpeg.",
             )
             # Strategy 2: mkvpropedit — zero-remux, cannot produce exit 183.
             strategies.append({
