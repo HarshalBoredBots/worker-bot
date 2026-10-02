@@ -11,6 +11,7 @@ dnspython
 # directly, so no Python ffmpeg wrapper is needed.
 Pillow
 hachoir
+mutagen  # pure-Python MKV/MP4 metadata fallback when FFmpeg exits 183
 
 # ── HTTP / async I/O ─────────────────────────────────────────────────────────
 aiohttp
