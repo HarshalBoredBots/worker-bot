@@ -418,13 +418,11 @@ async def add_metadata(
         #
         # The ONLY reliable way to handle these files is:
         # 1. In-place tag editors (mkvpropedit, mutagen) — never touch streams.
-        # 2. FFmpeg with ONLY the streams that passed the test-mux — these are
-        #    empirically verified to remux without exit 183. We guard against
-        #    accidentally dropping the main video by checking _safe_indices
-        #    contains at least one video-type stream before using them.
-        # 3. FFmpeg excluding only the one specific stream index that failed
-        #    test-mux (stream 0 = corrupt MJPEG cover art in these files).
-        # 4. Fallbacks.
+        # 2. FFmpeg excluding ONLY the exact stream indices that failed test-mux.
+        #    The test-mux identifies corrupt streams (MJPEG cover art with broken
+        #    codec params). We do NOT use the safe_indices allowlist because
+        #    test-mux -t 1 incorrectly rejects HEVC (takes >1s to write cues).
+        # 3. FFmpeg -map 0 bare, last resort.
         #
         # We do NOT use -map 0 -map -0:d -map -0:t because the problem stream
         # is typed as "video" by ffprobe (MJPEG cover art), so -0:t/-0:d don't
@@ -457,30 +455,14 @@ async def add_metadata(
                 "fields": metadata_fields,
             })
 
-        # Strategy 3: FFmpeg mapping only the streams that passed test-mux.
-        # These indices are empirically safe — the test-mux ran each one through
-        # a real Matroska write so exit 183 is impossible.
-        # Guard: only use if safe_indices includes at least one video stream,
-        # so we never produce a video-less output.
-        if _safe_indices:
-            _safe_has_video = any(
-                s.get("codec_type") == "video"
-                for s in _streams
-                if s.get("index") in _safe_indices
-            )
-            _all_has_video = any(s.get("codec_type") == "video" for s in _streams)
-            if _safe_has_video or not _all_has_video:
-                _explicit_maps: list[str] = []
-                for idx in _safe_indices:
-                    _explicit_maps += ["-map", f"0:{idx}"]
-                strategies.append(
-                    _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
-                    + meta_args + [output_path]
-                )
-
-        # Strategy 4: FFmpeg excluding ONLY the failed stream indices by number.
-        # More surgical than -map -0:t/-0:d — removes the exact corrupt streams
-        # that cause exit 183 regardless of their codec_type label.
+        # Strategy 3: FFmpeg excluding the exact indices that failed test-mux.
+        # This is the PRIMARY FFmpeg strategy. The failed indices are streams
+        # that the Matroska muxer cannot write (corrupt MJPEG cover art, broken
+        # codec params). Excluding them by index is surgical and correct — unlike
+        # -map -0:t/-0:d which won't exclude streams mislabeled as "video".
+        # Note: we do NOT use the safe_indices allowlist because the test-mux
+        # with -t 1 incorrectly fails HEVC streams (large files take >1s to
+        # write cues), so safe_indices would exclude the main HEVC video track.
         if _failed_indices:
             _excl_maps: list[str] = ["-map", "0"]
             for idx in _failed_indices:
@@ -490,7 +472,7 @@ async def add_metadata(
                 + meta_args + [output_path]
             )
 
-        # Strategy 5: FFmpeg -map 0 bare (last resort, may exit 183)
+        # Strategy 4: FFmpeg -map 0 bare (last resort, may exit 183)
         strategies.append(
             _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
             + meta_args + [output_path]
