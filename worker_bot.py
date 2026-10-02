@@ -149,18 +149,58 @@ def _bootstrap_mkvtoolnix() -> None:
 
     os.makedirs(bin_dir, exist_ok=True)
 
-    # Static mkvtoolnix builds from mkvtoolnix.download
-    URLS = [
-        "https://mkvtoolnix.download/appimage/MKVToolNix_GUI-88.0-x86_64.AppImage",
-    ]
+    # mkvtoolnix.download keeps only the CURRENT release tarball, so the version
+    # in the URL goes stale quickly.  We discover the live version first by
+    # scraping the directory index, then fall back to a wide static list.
+    import re as _re
 
-    # AppImage approach won't work on Heroku (no FUSE).
-    # Use the static build from official releases instead.
-    STATIC_URLS = [
+    def _discover_mkvtoolnix_urls() -> list:
+        """Return candidate URLs, newest-first, by scraping the download index."""
+        try:
+            index_url = "https://mkvtoolnix.download/linux/"
+            with urllib.request.urlopen(index_url, timeout=10) as _r:
+                _html = _r.read().decode(errors="replace")
+            # Find all 64-bit tarball filenames in the directory listing
+            _found = _re.findall(
+                r'mkvtoolnix-64bit-([\d.]+)\.tar\.xz', _html
+            )
+            # Sort by version descending (numeric tuple sort)
+            def _ver(v):
+                try:
+                    return tuple(int(x) for x in v.split("."))
+                except Exception:
+                    return (0,)
+            _sorted = sorted(set(_found), key=_ver, reverse=True)
+            return [
+                f"https://mkvtoolnix.download/linux/mkvtoolnix-64bit-{v}.tar.xz"
+                for v in _sorted
+            ]
+        except Exception as _de:
+            print(f"[bootstrap] mkvtoolnix index discovery failed: {_de}", flush=True)
+            return []
+
+    # Combine discovered URLs with a wide static fallback list
+    # (covers recent releases in case the index scrape fails)
+    _static_fallback = [
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-90.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-89.0.tar.xz",
         "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-88.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-87.0.tar.xz",
         "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-86.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-85.0.tar.xz",
         "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-84.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-83.0.tar.xz",
+        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-82.0.tar.xz",
     ]
+    _discovered = _discover_mkvtoolnix_urls()
+    # Merge: discovered first (newest live version at the top), then static fallbacks
+    # De-duplicate while preserving order
+    _seen = set()
+    STATIC_URLS = []
+    for _u in _discovered + _static_fallback:
+        if _u not in _seen:
+            _seen.add(_u)
+            STATIC_URLS.append(_u)
 
     for url in STATIC_URLS:
         try:

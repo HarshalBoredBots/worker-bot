@@ -243,8 +243,9 @@ async def add_metadata(
         probe_ok = False
 
         try:
+            _ffprobe = _find_binary("ffprobe") or "ffprobe"
             _probe = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "quiet",
+                _ffprobe, "-v", "quiet",
                 "-print_format", "json",
                 "-show_streams", "-show_format",
                 input_path,
