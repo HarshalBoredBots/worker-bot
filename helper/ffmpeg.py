@@ -16,10 +16,37 @@ import functools
 import json
 import os
 import random
+import shutil
 import time
 from typing import Any
 
 from messages import log, Msg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _find_binary — locate ffmpeg / mkvpropedit / etc.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_binary(name: str) -> str | None:
+    """
+    Locate a binary by name.
+
+    Search order:
+      1. <repo_root>/bin/<name>  — binaries bootstrapped at dyno startup
+         (ffmpeg, ffprobe, mkvpropedit downloaded by worker_bot.py bootstrap)
+      2. shutil.which(name)      — anything on the system PATH
+
+    Returns the full path string if found and executable, else None.
+    """
+    # repo_root is one level above this file's directory (helper/)
+    bin_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+    )
+    local = os.path.join(bin_dir, name)
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return shutil.which(name)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
