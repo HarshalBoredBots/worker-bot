@@ -20,8 +20,11 @@ echo "    Downloading FFmpeg static build..."
 curl -L "$FFMPEG_URL" -o "$ARCHIVE"
 
 echo "    Extracting..."
-tar -xf "$ARCHIVE" --strip-components=1 --wildcards "*/ffmpeg" "*/ffprobe" -C bin/
-rm "$ARCHIVE"
+mkdir -p _ffmpeg_tmp
+tar -xf "$ARCHIVE" -C _ffmpeg_tmp/
+find _ffmpeg_tmp/ -maxdepth 2 -name "ffmpeg"  -type f -exec cp {} bin/ffmpeg  \;
+find _ffmpeg_tmp/ -maxdepth 2 -name "ffprobe" -type f -exec cp {} bin/ffprobe \;
+rm -rf "$ARCHIVE" _ffmpeg_tmp/
 
 chmod +x bin/ffmpeg bin/ffprobe
 
