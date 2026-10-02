@@ -309,56 +309,106 @@ async def add_metadata(
         _input_ext = os.path.splitext(input_path)[1].lower()
 
         if _input_ext == ".mkv":
-            # ── Strategy: mutagen pure-Python in-place MKV tag edit ───────────
-            # mutagen.MKV edits tags directly in the MKV container without
-            # remuxing any streams — identical behaviour to mkvpropedit.
-            # This is the ONLY reliable approach for anime MKVs that have
-            # broken attachment streams (embedded fonts with codec_name=none)
-            # which cause FFmpeg to exit 183 on every remux attempt.
-            # mutagen is already in requirements.txt and always available.
-            _mutagen_ok = False
-            try:
+            # ── mkvpropedit path ──────────────────────────────────────────────
+            _mkvpropedit = _find_binary("mkvpropedit")
+            if _mkvpropedit and os.path.isfile(_mkvpropedit):
+                # mkvpropedit edits the INPUT file in-place.
+                # We copy input → output first, then edit output in-place.
                 import shutil as _shutil
-                from mutagen.matroska import Matroska as _Matroska
-
-                # Copy input → output; edit output in-place (keeps input intact)
-                _shutil.copy2(input_path, output_path)
-
-                _mkv = _Matroska(output_path)
-
-                # Global container tags
-                _tag_map = {
-                    "TITLE":   (metadata_fields.get("title")   or "").strip(),
-                    "ARTIST":  (metadata_fields.get("artist")  or "").strip(),
-                    "AUTHOR":  (metadata_fields.get("author")  or "").strip(),
-                    "COMMENT": (metadata_fields.get("comment") or "").strip(),
-                }
-                for _k, _v in _tag_map.items():
-                    if _v:
-                        _mkv.tags[_k] = [_v]
-
-                # Note: mutagen's Matroska only supports global container-level
-                # tags (TITLE, ARTIST, etc.).  Per-track TrackEntry.Name fields
-                # are not exposed by mutagen's API and are left unchanged.
-
-                _mkv.save()
-                _mutagen_ok = True
-                log.debug("[add_metadata] mutagen MKV tag edit succeeded")
-                await _safe_edit(ms, "✅ Metadata added.")
-                return output_path
-
-            except Exception as _me:
-                log.warning(
-                    "[add_metadata] mutagen MKV edit failed: {err} — trying FFmpeg",
-                    err=_me,
-                )
-                # Clean up partial output if the copy succeeded but save failed
-                if os.path.exists(output_path) and not _mutagen_ok:
-                    try:
+                try:
+                    _shutil.copy2(input_path, output_path)
+                except Exception as _ce:
+                    log.warning("[add_metadata] copy for mkvpropedit failed: {err}", err=_ce)
+                    if os.path.exists(output_path):
                         os.remove(output_path)
-                    except Exception:
-                        pass
-                # Fall through to FFmpeg strategies below
+
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    # Build mkvpropedit command
+                    # --tags all: clears existing tags, --add-track-statistics-tags: optional
+                    mkv_cmd = [_mkvpropedit, output_path, "--tags", "all:"]
+
+                    # Global tags via XML (mkvpropedit needs XML format for tags)
+                    # Build a minimal tag XML
+                    _tag_lines = []
+                    _TITLE_TAG = (metadata_fields.get("title") or "").strip()
+                    if _TITLE_TAG:
+                        _tag_lines.append(f'    <Simple><Name>TITLE</Name><String>{_TITLE_TAG}</String></Simple>')
+                    _ARTIST = (metadata_fields.get("artist") or "").strip()
+                    if _ARTIST:
+                        _tag_lines.append(f'    <Simple><Name>ARTIST</Name><String>{_ARTIST}</String></Simple>')
+                    _AUTHOR = (metadata_fields.get("author") or "").strip()
+                    if _AUTHOR:
+                        _tag_lines.append(f'    <Simple><Name>AUTHOR</Name><String>{_AUTHOR}</String></Simple>')
+                    _COMMENT = (metadata_fields.get("comment") or "").strip()
+                    if _COMMENT:
+                        _tag_lines.append(f'    <Simple><Name>COMMENT</Name><String>{_COMMENT}</String></Simple>')
+
+                    if _tag_lines:
+                        import tempfile as _tf
+                        _xml_content = (
+                            '<?xml version="1.0"?>\n'
+                            '<!DOCTYPE Tags SYSTEM "matroskatags.dtd">\n'
+                            '<Tags>\n'
+                            '  <Tag>\n'
+                            '    <Targets/>\n'
+                            + "\n".join(_tag_lines) + "\n"
+                            '  </Tag>\n'
+                            '</Tags>\n'
+                        )
+                        _xml_fd, _xml_path = _tf.mkstemp(suffix=".xml")
+                        try:
+                            with os.fdopen(_xml_fd, "w") as _xf:
+                                _xf.write(_xml_content)
+                            mkv_cmd += ["--tags", f"all:{_xml_path}"]
+
+                            # Track title tags
+                            _audio_title = (metadata_fields.get("audio") or "").strip()
+                            _video_title = (metadata_fields.get("video") or "").strip()
+                            _sub_title   = (metadata_fields.get("subtitle") or "").strip()
+                            if _audio_title:
+                                mkv_cmd += ["--edit", "track:a1", "--set", f"name={_audio_title}"]
+                            if _video_title:
+                                mkv_cmd += ["--edit", "track:v1", "--set", f"name={_video_title}"]
+                            if _sub_title:
+                                mkv_cmd += ["--edit", "track:s1", "--set", f"name={_sub_title}"]
+
+                            log.debug(
+                                "[add_metadata] mkvpropedit cmd: {cmd}",
+                                cmd=" ".join(mkv_cmd),
+                            )
+                            _mp = await asyncio.create_subprocess_exec(
+                                *mkv_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            _mp_out, _mp_err = await _mp.communicate()
+                            _mp_stderr = _mp_err.decode(errors="replace").strip()
+
+                            if _mp.returncode == 0:
+                                log.debug("[add_metadata] mkvpropedit succeeded")
+                                await _safe_edit(ms, "✅ Metadata added.")
+                                return output_path
+                            else:
+                                log.warning(
+                                    "[add_metadata] mkvpropedit failed (exit={rc}): {err}",
+                                    rc=_mp.returncode, err=_mp_stderr[-300:],
+                                )
+                                # Fall through to FFmpeg strategies below
+                        finally:
+                            try:
+                                os.unlink(_xml_path)
+                            except Exception:
+                                pass
+                    else:
+                        # No tags to write — just copy and return
+                        await _safe_edit(ms, "✅ Metadata added.")
+                        return output_path
+            else:
+                log.warning(
+                    "[add_metadata] mkvpropedit not found (searched bin/ and PATH) — "
+                    "FFmpeg fallback will likely fail on MKVs with embedded font attachments "
+                    "(exit 183). Install mkvtoolnix or ensure the bootstrap downloaded it."
+                )
 
         # ── 4. FFmpeg fallback (non-MKV or mkvpropedit failed) ───────────────
 

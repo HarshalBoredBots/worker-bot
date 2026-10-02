@@ -13,6 +13,7 @@ LABEL description="Telegram file rename worker with FFmpeg metadata injection"
 # ── System dependencies ───────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        mkvtoolnix \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -490,17 +490,17 @@ class JobPipeline:
                     file_path    = metadata_path
                     meta_applied = True
                 else:
-                    logger.error(
+                    # Metadata embed failed (most likely an MKV with broken font-attachment
+                    # streams and mkvpropedit not available). Rather than failing the whole
+                    # job, warn and continue with the original downloaded file so the user
+                    # still receives their renamed file — just without the embedded tags.
+                    logger.warning(
                         "[pipeline] job=%s Metadata embed FAILED "
-                        "(input=%d bytes, ffmpeg returned no output)",
+                        "(input=%d bytes) — continuing with original file (no tags embedded)",
                         job_id, _dl_size,
                     )
-                    await self._send_failed(
-                        job_id,
-                        "Metadata injection failed — FFmpeg could not process the file. "
-                        "The file may be corrupted or in an unsupported container format.",
-                    )
-                    return
+                    meta_applied = False
+                    # file_path stays pointing at the downloaded file
 
                 duration = 0
                 try:
