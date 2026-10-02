@@ -222,7 +222,7 @@ def _mutagen_embed(input_path: str, output_path: str, metadata_fields: dict) -> 
         _shutil.copy2(input_path, output_path)
         mf = MutagenFile(output_path, easy=True)
         if mf is None:
-            log.warning("[add_metadata] mutagen could not open: %s", output_path)
+            log.warning("[add_metadata] mutagen could not open: {path}", path=output_path)
             return False
         title  = (metadata_fields.get("title") or "").strip()
         artist = (metadata_fields.get("artist") or metadata_fields.get("author") or "").strip()
@@ -246,7 +246,7 @@ def _mutagen_embed(input_path: str, output_path: str, metadata_fields: dict) -> 
         log.debug("[add_metadata] mutagen embed succeeded")
         return True
     except Exception as _me:
-        log.warning("[add_metadata] mutagen embed error: %s", _me)
+        log.warning("[add_metadata] mutagen embed error: {err}", err=_me)
         return False
 
 
@@ -429,7 +429,7 @@ async def add_metadata(
                     _, _err = await _p.communicate()
                     last_rc = _p.returncode
                     if last_rc == 0 and os.path.exists(cmd["output"]) and os.path.getsize(cmd["output"]) > 0:
-                        log.debug("[add_metadata] strategy %d (mkvpropedit) succeeded", attempt)
+                        log.debug("[add_metadata] strategy {n} (mkvpropedit) succeeded", n=attempt)
                         output_path = cmd["output"]
                         success = True
                         break
@@ -471,7 +471,7 @@ async def add_metadata(
             if stderr_txt:
                 log.debug(Msg.META_FFMPEG_STDERR, stderr=stderr_txt[-800:])
             if last_rc == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                log.debug("[add_metadata] strategy %d succeeded", attempt)
+                log.debug("[add_metadata] strategy {n} succeeded", n=attempt)
                 success = True
                 break
             log.warning("[add_metadata] strategy {n} failed (exit={rc}) — trying next",
