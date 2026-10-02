@@ -39,12 +39,6 @@ from helper.ffmpeg import add_metadata, get_duration_hachoir
 from helper.utils import add_prefix_suffix, convert, humanbytes
 from helper.queue_manager import qm as _qm, rq as _rq
 from helper.reliable_download import download_with_retry, DownloadFailedError
-from helper.upload_manager import (
-    upload_with_floodwait,
-    dump_to_user_channel,
-    dump_to_bot_channel,
-)
-from helper.transfer_metrics import JobMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -988,7 +982,6 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
 
         _src_size  = getattr(file_obj, "file_size", 0) or 0
         file_path: Optional[str] = None
-        metrics = JobMetrics(job_id)
         logger.info(
             "[auto_rename] job=%s Starting download  source=%s  path=%s",
             job_id, humanbytes(_src_size), download_path,
@@ -997,7 +990,6 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         # ── Download via retry-safe helper ────────────────────────────────────
         # Handles: 503 timeouts, 0-byte results, size validation, partial cleanup.
         file_path: Optional[str] = None
-        metrics.start_download(_src_size)
         try:
             file_path = await download_with_retry(
                 client        = client,
@@ -1010,7 +1002,6 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
                 status_msg    = status_msg,
                 job_id        = job_id,
             )
-            metrics.end_download(os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0)
         except asyncio.CancelledError:
             raise
         except DownloadFailedError as _dfe:
@@ -1050,24 +1041,17 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         except Exception:
             pass
 
-        # ── Hardcoded metadata — always embed @Animes_Ocean ──────────────────
-        # These values are fixed in code and cannot be changed by any user,
-        # command, or database setting.
-        use_metadata    = True
-        metadata_fields = {
-            "title":    "@Animes_Ocean",
-            "artist":   "@Animes_Ocean",
-            "author":   "@Animes_Ocean",
-            "comment":  "@Animes_Ocean",
-            "audio":    "@Animes_Ocean",
-            "video":    "@Animes_Ocean",
-            "subtitle": "@Animes_Ocean",
-        }
-        _has_metadata_values = True
+        # ── Resolve metadata: global override OR per-user ─────────────────────
+        # get_effective_metadata checks the global flag first; if ON, returns
+        # owner fields.  Otherwise returns per-user settings unchanged.
+        try:
+            use_metadata, metadata_fields = await jishubotz.get_effective_metadata(user_id)
+        except Exception:
+            pass   # keep values loaded by get_pipeline_settings above
+
+        _has_metadata_values = any((v or "").strip() for v in metadata_fields.values())
         if use_metadata and _has_metadata_values:
-            metrics.start_metadata()
             result = await add_metadata(file_path, metadata_path, metadata_fields, status_msg)
-            metrics.end_metadata()
             if result and os.path.exists(metadata_path):
                 file_path     = metadata_path
                 _meta_applied = True
@@ -1141,7 +1125,6 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         job.status   = "uploading"
         last_edit[0] = 0.0
         c_time       = time.time()
-        metrics.start_upload(_upload_size)
         try:
             await status_msg.edit_text(
                 _status_text(job_id, new_file_name_ps, "uploading", 0, 0),
@@ -1154,109 +1137,82 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         _REF_LARGE = 2_090_000_000
         _bin_sent  = None
 
-        # ── Upload with FloodWait handling ────────────────────────────────
-        # upload_with_floodwait() retries on FloodWait without marking the
-        # job done.  Job remains "uploading" until we confirm success.
-        # The job is ONLY marked done after sent is confirmed non-None.
-        sent = None
-
+        # Slot already owned by rq — upload directly, no extra semaphore.
         if _file_size > _REF_LARGE and _ub:
-            # ── Large-file: userbot → BIN_CHANNEL → bot copies to user ───
+            # ── Large-file path: userbot → BIN_CHANNEL → copy → user ─────
             if upload_type == "document":
-                async def _ul_coro_bin():
-                    return await _ul_client.send_document(
-                        _Cfg.BIN_CHANNEL, document=file_path,
-                        file_name=new_file_name_ps, thumb=ph_path, caption=caption,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
+                _bin_sent = await _ul_client.send_document(
+                    _Cfg.BIN_CHANNEL,
+                    document=file_path,
+                    file_name=new_file_name_ps,
+                    thumb=ph_path,
+                    caption=caption,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
             elif upload_type == "video":
-                async def _ul_coro_bin():
-                    return await _ul_client.send_video(
-                        _Cfg.BIN_CHANNEL, video=file_path, thumb=ph_path,
-                        caption=caption, duration=int(duration) if duration else None,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
+                _bin_sent = await _ul_client.send_video(
+                    _Cfg.BIN_CHANNEL,
+                    video=file_path,
+                    thumb=ph_path,
+                    caption=caption,
+                    duration=int(duration) if duration else None,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
             else:
-                async def _ul_coro_bin():
-                    return await _ul_client.send_audio(
-                        _Cfg.BIN_CHANNEL, audio=file_path, thumb=ph_path,
-                        caption=caption, duration=int(duration) if duration else None,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
-
-            _bin_sent = await upload_with_floodwait(
-                _ul_coro_bin, job_id=job_id, status_msg=status_msg
+                _bin_sent = await _ul_client.send_audio(
+                    _Cfg.BIN_CHANNEL,
+                    audio=file_path,
+                    thumb=ph_path,
+                    caption=caption,
+                    duration=int(duration) if duration else None,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
+            await asyncio.sleep(2)
+            sent = await client.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=_bin_sent.chat.id,
+                message_id=_bin_sent.id,
+                caption=caption,
             )
-            if not _bin_sent:
-                try:
-                    await status_msg.edit_text(
-                        f"╭━━━〔 ❌ UPLOAD FAILED 〕━━━╮\n"
-                        f"┃  🆔  <code>{job_id}</code>\n"
-                        f"┃  ⚠️  FloodWait retries exhausted.\n"
-                        f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
-                    )
-                except Exception:
-                    pass
-                return   # job NOT marked done — upload never succeeded
-
-            # Wait for Telegram to index the message before copying.
-            # Use short retries instead of a fixed sleep.
-            sent = None
-            for _copy_attempt in range(3):
-                await asyncio.sleep(1 + _copy_attempt)
-                try:
-                    sent = await client.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=_bin_sent.chat.id,
-                        message_id=_bin_sent.id,
-                        caption=caption,
-                    )
-                    break
-                except Exception as _ce:
-                    logger.warning("[auto_rename] job=%s copy_message attempt %d failed: %s",
-                                   job_id, _copy_attempt + 1, _ce)
-            logger.info("[auto_rename] job=%s Large-file relay bin=%d user=%d",
-                        job_id, _bin_sent.id, sent.id if sent else -1)
+            logger.info(
+                "[auto_rename] job=%s Large-file relay complete  bin_msg=%d  user_msg=%d",
+                job_id, _bin_sent.id, sent.id,
+            )
         else:
-            # ── Normal: bot → user directly ───────────────────────────────
+            # ── Normal path: bot sends directly to user ───────────────────
             if upload_type == "document":
-                async def _ul_coro():
-                    return await client.send_document(
-                        message.chat.id, document=file_path,
-                        file_name=new_file_name_ps, thumb=ph_path, caption=caption,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
+                sent = await client.send_document(
+                    message.chat.id,
+                    document=file_path,
+                    file_name=new_file_name_ps,
+                    thumb=ph_path,
+                    caption=caption,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
             elif upload_type == "video":
-                async def _ul_coro():
-                    return await client.send_video(
-                        message.chat.id, video=file_path, thumb=ph_path,
-                        caption=caption, duration=int(duration) if duration else None,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
+                sent = await client.send_video(
+                    message.chat.id,
+                    video=file_path,
+                    thumb=ph_path,
+                    caption=caption,
+                    duration=int(duration) if duration else None,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
             else:
-                async def _ul_coro():
-                    return await client.send_audio(
-                        message.chat.id, audio=file_path, thumb=ph_path,
-                        caption=caption, duration=int(duration) if duration else None,
-                        progress=_prog, progress_args=(status_msg, c_time),
-                    )
-
-            sent = await upload_with_floodwait(
-                _ul_coro, job_id=job_id, status_msg=status_msg
-            )
-            if not sent:
-                try:
-                    await status_msg.edit_text(
-                        f"╭━━━〔 ❌ UPLOAD FAILED 〕━━━╮\n"
-                        f"┃  🆔  <code>{job_id}</code>\n"
-                        f"┃  ⚠️  FloodWait retries exhausted.\n"
-                        f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
-                    )
-                except Exception:
-                    pass
-                return   # job NOT marked done
-
-        metrics.end_upload(actual_size)
+                sent = await client.send_audio(
+                    message.chat.id,
+                    audio=file_path,
+                    thumb=ph_path,
+                    caption=caption,
+                    duration=int(duration) if duration else None,
+                    progress=_prog,
+                    progress_args=(status_msg, c_time),
+                )
 
         # ── Leaderboard + history ─────────────────────────────────────────
         try:
@@ -1274,52 +1230,65 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
         except Exception:
             _uname_str = "No Username"
 
-        _orig_for_log = file_caption if file_caption else file_name
-        _final_path_for_mi = (
-            metadata_path
-            if _meta_applied and metadata_path and os.path.exists(metadata_path)
-            else file_path
-        )
-
-        # ── BOT dump + MediaInfo — AWAITED before file cleanup ────────────
-        # dump_to_bot_channel internally awaits MediaInfo/Telegraph so it is
-        # safe to delete the local file immediately after this returns.
+        # ── Log to BIN/LOG channel (caption + thumb) ─────────────────────
+        # For large files the userbot already uploaded to BIN_CHANNEL as
+        # _bin_sent; just edit its caption instead of copying again.
+        # For normal files, copy sent → BIN_CHANNEL with the rich caption.
         try:
-            await dump_to_bot_channel(
-                client        = client,
-                user_id       = user_id,
-                channel_id    = _Cfg.BIN_CHANNEL,
-                sent_msg      = sent,
-                original_name = _orig_for_log,
-                new_name      = new_file_name_ps,
-                username_str  = _uname_str,
-                job_id        = job_id,
-                file_size     = actual_size,
-                final_file_path = _final_path_for_mi or "",
-                ul_client     = _ul_client if _bin_sent else None,
-                bin_sent      = _bin_sent,
-                metrics       = metrics,
+            _orig_for_log = file_caption if file_caption else file_name
+            _log_cap = (
+                "╭━━━〔 📂 FILE INFO 〕━━━╮\n\n"
+                f"📂 Original:\n<code>{_orig_for_log}</code>\n\n"
+                f"➜ ✏️ Renamed:\n<code>{new_file_name_ps}</code>\n\n"
+                f"👤 User: {_uname_str}\n"
+                f"🆔 ID: <code>{user_id}</code>\n\n"
+                f"🆔 Job: <code>{job_id}</code>\n"
+                f"📦 Size: {humanbytes(actual_size)}\n"
+                f"📊 Status: Completed\n\n"
+                "╰━━━━━━━━━━━━━━━━━━━━━━╯"
             )
-        except Exception as _ble:
-            logger.warning("[auto_rename] BIN_CHANNEL dump error job=%s: %s", job_id, _ble)
+            if _bin_sent:
+                # Already in BIN_CHANNEL — just update the caption
+                try:
+                    await _ul_client.edit_message_caption(
+                        _bin_sent.chat.id, _bin_sent.id, caption=_log_cap,
+                    )
+                except Exception:
+                    pass   # caption edit failure is non-fatal
+            else:
+                await client.copy_message(
+                    chat_id=_Cfg.BIN_CHANNEL,
+                    from_chat_id=message.chat.id,
+                    message_id=sent.id,
+                    caption=_log_cap,
+                )
+        except Exception as _le:
+            logger.warning("[auto_rename] BIN_CHANNEL log failed job=%s: %s", job_id, _le)
 
-        # ── USER dump — AWAITED, uses Telegram-side copy (no re-upload) ───
+        # ── Dump channel (universal — same setting as manual rename) ──────
         try:
             if _ps.get("dump_mode") and _ps.get("dump_channel"):
-                await dump_to_user_channel(
-                    client          = client,
-                    user_id         = user_id,
-                    channel_id      = int(_ps["dump_channel"]),
-                    sent_msg        = sent,
-                    new_name        = new_file_name_ps,
-                    job_id          = job_id,
-                    final_file_path = _final_path_for_mi or "",
-                    metrics         = metrics,
+                from plugins.file_rename import _dump_to_channel
+                # Determine which local file is the final processed version
+                _final_path_for_mi = (
+                    metadata_path
+                    if _meta_applied and metadata_path and os.path.exists(metadata_path)
+                    else file_path
                 )
-        except Exception as _ude:
-            logger.warning("[auto_rename] user dump error job=%s: %s", job_id, _ude)
+                asyncio.create_task(
+                    _dump_to_channel(
+                        client, user_id, int(_ps["dump_channel"]), sent,
+                        original_name=file_name,
+                        new_name=new_file_name_ps,
+                        username_str=_uname_str,
+                        job_id=job_id,
+                        file_size=actual_size,
+                        final_file_path=_final_path_for_mi or "",
+                    )
+                )
+        except Exception:
+            pass
 
-        metrics.log_summary()
         job.status = "done"
         # Clean up: delete progress message and the original file message
         for _m in (status_msg, message):
@@ -1368,7 +1337,9 @@ async def _run_pipeline(client: Client, job: _Job) -> None:
             await jishubotz.delete_pending_job(job_id)
         except Exception as _dpe:
             logger.warning("[auto_rename] delete_pending_job failed job=%s: %s", job_id, _dpe)
-        # Dumps and MediaInfo are awaited above — safe to clean up immediately.
+        # Brief pause: let the _dump_to_channel MediaInfo task read the file
+        # before we delete it.  ffprobe is fast (~1–2 s); 5 s is generous.
+        await asyncio.sleep(5)
         for path in (download_path, metadata_path):
             if path and os.path.exists(path):
                 try: os.remove(path)

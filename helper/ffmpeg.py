@@ -176,87 +176,9 @@ async def get_duration_hachoir(file_path: str) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# add_metadata — async ffmpeg subprocess
+# ✔ asyncio.create_subprocess_exec → never blocks event loop
 # ══════════════════════════════════════════════════════════════════════════════
-# add_metadata — pure asyncio.create_subprocess_exec (NO ffmpeg-python dep)
-#
-# Strategy cascade for font-heavy anime MKVs that cause FFmpeg exit 183:
-#
-#   1. FFmpeg: map only safe stream indices (V+a+s by explicit index, skipping
-#      data/attachment streams that corrupt the output container header).
-#   2. mkvpropedit: zero-remux binary edit — immune to exit 183 by design.
-#      Binary located at ./bin/mkvpropedit (installed by build.sh).
-#   3. mutagen: pure-Python fallback — no binary deps, always available.
-#      Works on MKV/MP4/FLAC/OGG/MP3. Does not re-mux anything.
-#   4. FFmpeg: plain -map 0 -ignore_unknown for files without unsafe streams.
-#   5. FFmpeg: bare -c copy for simple files with no unusual streams.
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Codec types FFmpeg can safely copy into a new Matroska/MP4 container.
-_SAFE_CODEC_TYPES = {"video", "audio", "subtitle"}
-
-
-def _find_binary(name: str) -> str:
-    """Prefer ./bin/<name> (our static build) over system PATH."""
-    import shutil as _shutil
-    local = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", name
-    )
-    if os.path.isfile(local) and os.access(local, os.X_OK):
-        return local
-    found = _shutil.which(name)
-    if found:
-        log.warning(
-            "[ffmpeg] WARNING: static ./bin/{name} not found — falling back to "
-            "system {name} at {path}. This may be too old to handle HEVC/H.265 "
-            "and will produce degraded output. Ensure build.sh ran successfully "
-            "on deploy so ./bin/{name} is installed.",
-            name=name, path=found,
-        )
-    return found or name
-
-
-def _mutagen_embed(input_path: str, output_path: str, metadata_fields: dict) -> bool:
-    """
-    Pure-Python metadata embed via mutagen. Copies input→output then edits
-    tags in-place. Returns True on success, False on any failure.
-    """
-    import shutil as _shutil
-    try:
-        from mutagen import File as MutagenFile
-    except ImportError:
-        log.warning("[add_metadata] mutagen not installed — skipping Python fallback")
-        return False
-    try:
-        _shutil.copy2(input_path, output_path)
-        mf = MutagenFile(output_path, easy=True)
-        if mf is None:
-            log.warning("[add_metadata] mutagen could not open: {path}", path=output_path)
-            return False
-        title  = (metadata_fields.get("title") or "").strip()
-        artist = (metadata_fields.get("artist") or metadata_fields.get("author") or "").strip()
-        comment = (metadata_fields.get("comment") or "").strip()
-        if title:
-            try:
-                mf["title"] = [title]
-            except Exception:
-                pass
-        if artist:
-            try:
-                mf["artist"] = [artist]
-            except Exception:
-                pass
-        if comment:
-            try:
-                mf["comment"] = [comment]
-            except Exception:
-                pass
-        mf.save()
-        log.debug("[add_metadata] mutagen embed succeeded")
-        return True
-    except Exception as _me:
-        log.warning("[add_metadata] mutagen embed error: {err}", err=_me)
-        return False
-
 
 async def add_metadata(
     input_path: str,
@@ -266,389 +188,223 @@ async def add_metadata(
 ) -> str | None:
     """
     Embed metadata tags into *input_path* → *output_path*.
-    Stream copy only — no re-encode. Returns output_path on success, None on failure.
-    ms : Pyrogram Message to edit with progress, or None (silent mode).
-    """
+    Stream copy — no re-encode. Returns output_path on success, None on failure.
 
-    _SUPPORTED_EXTS = {
-        ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".flv",
-        ".webm", ".ts", ".m2ts", ".mts", ".mpeg", ".mpg", ".vob",
-        ".3gp", ".3g2", ".ogv", ".rm", ".rmvb", ".divx", ".asf",
-        ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav",
-        ".wma", ".aiff", ".aif", ".ape", ".wv", ".mka", ".mpa",
-    }
-    _input_ext = os.path.splitext(input_path)[1].lower()
-    if _input_ext not in _SUPPORTED_EXTS:
-        log.warning(
-            "[add_metadata] Unsupported file type '{ext}' — skipping FFmpeg.",
-            ext=_input_ext,
-        )
-        return None
+    Strategy:
+      1. ffprobe all streams → get exact indices of video/audio/subtitle streams.
+         Exclude attachment/data/font streams entirely by index.
+         This is the ONLY reliable fix for anime MKVs with embedded fonts
+         (codec_type=attachment, codec_name=none) that cause FFmpeg exit 183
+         ("Could not write header: Invalid data found when processing input").
+      2. Run ffmpeg with explicit -map 0:INDEX for each good stream.
+         Fallback: -map 0:V? -map 0:a? -map 0:s? if probe failed.
+      3. Last resort: -map 0 -ignore_unknown.
+
+    Progress bar uses -progress pipe:1 (key=value lines on stdout).
+    Throttled to 1 edit per 5 seconds.
+    """
+    import math
+    from helper.utils import humanbytes, TimeFormatter
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-        # ── 1. Discover writable stream indices via test-mux ─────────────────
-        # ffprobe codec_type is unreliable for these anime MKVs: streams that
-        # report as video/audio/subtitle still cause exit 183 at the Matroska
-        # muxer level due to corrupt internal codec parameters.  The only
-        # trustworthy method is to attempt a zero-frame null mux of each stream
-        # individually and keep only the ones that succeed.
-        _UNWRITABLE_CODECS = {"none", "unknown", ""}
-        _safe_indices: list[int] = []
-        _failed_indices: list[int] = []
-        _has_unsafe_streams = False
-        _streams: list[dict] = []
-        try:
-            _ffprobe = _find_binary("ffprobe")
-            _ffmpeg  = _find_binary("ffmpeg")
+        # ── 1. Probe: duration + exact good stream indices ─────────────────────
+        total_us: int = 0
+        good_indices: list[int] = []   # video/audio/subtitle stream indices only
+        probe_ok = False
 
-            # Step A: get all stream indices from ffprobe
-            _probe_proc = await asyncio.create_subprocess_exec(
-                _ffprobe, "-v", "quiet",
+        try:
+            _probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet",
                 "-print_format", "json",
-                "-show_streams",
+                "-show_streams", "-show_format",
                 input_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            _probe_out, _ = await _probe_proc.communicate()
-            _all_indices: list[int] = []
-            if _probe_proc.returncode == 0 and _probe_out:
-                _streams = json.loads(_probe_out.decode(errors="replace")).get("streams", [])
-                # Pre-filter: skip pure attachment/data streams (fonts, chapters)
-                # — these are never writable and would just slow down the test loop.
+            _probe_out, _ = await _probe.communicate()
+            if _probe.returncode == 0 and _probe_out:
+                _pd = json.loads(_probe_out.decode(errors="replace"))
+                # Duration
+                dur_str  = _pd.get("format", {}).get("duration", "0")
+                total_us = int(float(dur_str) * 1_000_000)
+                # Good stream indices: video, audio, subtitle only
+                # Skip: attachment (fonts), data (chapters/timecodes), none codec
                 _SKIP_TYPES = {"attachment", "data"}
-                _all_indices = [
-                    s["index"] for s in _streams
-                    if s.get("codec_type") not in _SKIP_TYPES
-                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
-                ]
-                _has_unsafe_streams = len(_all_indices) < len(_streams)
-
-            # Step B: test-mux each candidate index into a real temp MKV file.
-            # WHY a temp file and not pipe:1 or /dev/null:
-            #   - "-f null" skips codec-parameter validation → false positives
-            #   - "pipe:1" causes HEVC/H.265 streams to fail on older ffmpeg
-            #     builds because piped Matroska requires seekable output for
-            #     the cues index; the stream itself is fine but ffmpeg exits
-            #     non-zero, making us incorrectly drop the video track.
-            #   - A real temp file exercises the full header+cues write path
-            #     and gives a definitive result for every codec.
-            # We write only 1 second of data (-t 1) to keep it fast, then
-            # delete the temp file immediately after the test.
-            import tempfile as _tempfile
-            _tmp_dir = os.path.dirname(os.path.abspath(output_path))
-
-            # Build a lookup: index → codec_type, codec_name
-            _idx_info: dict[int, dict] = {
-                s["index"]: s for s in _streams if "index" in s
-            }
-
-            async def _test_stream(idx: int) -> bool:
-                """
-                Test whether stream idx can be muxed into a Matroska container.
-
-                Key constraints:
-                  - HEVC/H.265 video in large files requires >1s to write cues.
-                    With -t 1 the test always fails for HEVC even when the stream
-                    is perfectly fine.  We use -t 10 for video streams so the cues
-                    index has time to flush.
-                  - We NEVER exclude a stream whose codec_type is "video" based
-                    solely on a failed test-mux: a false negative here drops the
-                    entire main video track (the 1.4 GB HEVC stream), turning a
-                    1.46 GB file into a 280 MB audio-only output.
-                  - For audio/subtitle streams -t 3 is plenty.
-                  - Attachment/data streams are pre-filtered by _SKIP_TYPES above
-                    and never reach this function.
-                """
-                _info     = _idx_info.get(idx, {})
-                _ctype    = _info.get("codec_type", "")
-                _cname    = _info.get("codec_name", "").lower()
-
-                # SAFETY: never test-fail a main video stream.
-                # These are the codecs that need long cue-write time in MKV.
-                # We declare them writable without testing — if they genuinely
-                # can't be muxed, FFmpeg will still report exit 183 in strategy 3/4.
-                _SLOW_VIDEO_CODECS = {
-                    "hevc", "h265", "h264", "avc", "av1", "vp9", "vp8",
-                    "mpeg4", "mpeg2video", "theora",
-                }
-                if _ctype == "video" and _cname in _SLOW_VIDEO_CODECS:
-                    log.debug(
-                        "[add_metadata] test-mux: skipping test for video stream %d (%s) — "
-                        "declared writable (slow-cue codec)",
-                        idx, _cname,
-                    )
-                    return True
-
-                # For video we still test but give it 10 s; audio/sub get 3 s.
-                _t = "10" if _ctype == "video" else "3"
-
-                _tmp = os.path.join(_tmp_dir, f"_testmux_{idx}_{os.getpid()}.mkv")
-                try:
-                    _tp = await asyncio.create_subprocess_exec(
-                        _ffmpeg, "-y",
-                        "-probesize", "100M", "-analyzeduration", "100M",
-                        "-i", input_path,
-                        "-map", f"0:{idx}",
-                        "-t", _t,
-                        "-c", "copy",
-                        "-f", "matroska", _tmp,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await _tp.communicate()
-                    ok = _tp.returncode == 0 and os.path.exists(_tmp) and os.path.getsize(_tmp) > 0
-                    # Extra safety: never mark a video stream as failed.
-                    # Even if -t 10 isn't enough for some exotic encoder, we'd
-                    # rather try to include it and let FFmpeg handle the error.
-                    if not ok and _ctype == "video":
-                        log.warning(
-                            "[add_metadata] test-mux: video stream %d (%s) failed "
-                            "test-mux but will NOT be excluded (video safety rule)",
-                            idx, _cname,
-                        )
-                        return True
-                    return ok
-                except Exception:
-                    # On exception, be conservative: keep video, drop others.
-                    return _ctype == "video"
-                finally:
-                    try:
-                        if os.path.exists(_tmp):
-                            os.remove(_tmp)
-                    except Exception:
-                        pass
-
-            _test_results = await asyncio.gather(
-                *[_test_stream(i) for i in _all_indices]
-            )
-            _safe_indices = [
-                idx for idx, ok in zip(_all_indices, _test_results) if ok
-            ]
-            _failed_indices = [
-                idx for idx, ok in zip(_all_indices, _test_results) if not ok
-            ]
-
-            if _failed_indices:
-                _has_unsafe_streams = True
-                log.warning(
-                    "[add_metadata] test-mux: {n} stream(s) failed null-mux "
-                    "and will be excluded: indices {bad}",
-                    n=len(_failed_indices),
-                    bad=_failed_indices,
+                _SKIP_CODECS = {"none", "unknown", ""}
+                for s in _pd.get("streams", []):
+                    ct   = s.get("codec_type", "")
+                    cn   = s.get("codec_name", "none").lower()
+                    idx  = s.get("index")
+                    if (
+                        ct not in _SKIP_TYPES
+                        and cn not in _SKIP_CODECS
+                        and idx is not None
+                    ):
+                        good_indices.append(int(idx))
+                probe_ok = True
+                log.debug(
+                    "[add_metadata] probe OK — good stream indices: {idxs}",
+                    idxs=good_indices,
                 )
-            log.debug(
-                "[add_metadata] test-mux writable stream indices: {idxs}",
-                idxs=_safe_indices,
-            )
         except Exception as _pe:
-            log.warning("[add_metadata] probe/test-mux error: {err}", err=_pe)
+            log.warning("[add_metadata] probe failed: {err}", err=_pe)
 
-        # ── 2. Build metadata tag args ────────────────────────────────────────
+        # ── 2. Build metadata args ─────────────────────────────────────────────
         meta_args: list[str] = []
         for tag in ("title", "artist", "author", "comment"):
             val = (metadata_fields.get(tag) or "").strip()
             if val:
                 meta_args += ["-metadata", f"{tag}={val}"]
-        if (audio_title := (metadata_fields.get("audio") or "").strip()):
+
+        audio_title = (metadata_fields.get("audio") or "").strip()
+        video_title = (metadata_fields.get("video") or "").strip()
+        sub_title   = (metadata_fields.get("subtitle") or "").strip()
+        if audio_title:
             meta_args += ["-metadata:s:a", f"title={audio_title}"]
-        if (video_title := (metadata_fields.get("video") or "").strip()):
+        if video_title:
             meta_args += ["-metadata:s:v", f"title={video_title}"]
-        if (sub_title := (metadata_fields.get("subtitle") or "").strip()):
+        if sub_title:
             meta_args += ["-metadata:s:s", f"title={sub_title}"]
 
-        # ── 3. Build strategy list ────────────────────────────────────────────
-        _ffmpeg = _find_binary("ffmpeg")
+        # ── 3. Build strategies ────────────────────────────────────────────────
         _base = [
-            _ffmpeg, "-y",
+            "ffmpeg", "-y",
             "-probesize", "100M",
             "-analyzeduration", "100M",
             "-threads", "1",
             "-i", input_path,
         ]
-        strategies: list = []
 
-        # ── Strategy ordering ────────────────────────────────────────────────
-        #
-        # The ONLY reliable way to handle these files is:
-        # 1. In-place tag editors (mkvpropedit, mutagen) — never touch streams.
-        # 2. FFmpeg excluding ONLY the exact stream indices that failed test-mux.
-        #    The test-mux identifies corrupt streams (MJPEG cover art with broken
-        #    codec params). We do NOT use the safe_indices allowlist because
-        #    test-mux -t 1 incorrectly rejects HEVC (takes >1s to write cues).
-        # 3. FFmpeg -map 0 bare, last resort.
-        #
-        # We do NOT use -map 0 -map -0:d -map -0:t because the problem stream
-        # is typed as "video" by ffprobe (MJPEG cover art), so -0:t/-0:d don't
-        # exclude it. The only way to skip it is by explicit index exclusion.
+        strategies: list[list[str]] = []
 
-        # Strategy 1: mkvpropedit — in-place tag edit, no remux (MKV only).
-        # Pre-check binary exists to avoid a 1.5 GB copy then "not found".
-        _mkvpropedit_bin = _find_binary("mkvpropedit") if _input_ext == ".mkv" else None
-        if _mkvpropedit_bin and os.path.isfile(_mkvpropedit_bin):
-            strategies.append({
-                "type": "mkvpropedit",
-                "binary": _mkvpropedit_bin,
-                "input": input_path, "output": output_path,
-                "fields": metadata_fields,
-            })
-
-        # Strategy 2: mutagen — pure Python in-place embed.
-        # Pre-probe to skip files mutagen can't handle (returns None for many MKVs).
-        _mutagen_supported = False
-        try:
-            from mutagen import File as _MF
-            _mf_probe = _MF(input_path, easy=True)
-            _mutagen_supported = _mf_probe is not None
-        except Exception:
-            pass
-        if _mutagen_supported:
-            strategies.append({
-                "type": "mutagen",
-                "input": input_path, "output": output_path,
-                "fields": metadata_fields,
-            })
-
-        # Strategy 3: FFmpeg excluding the exact indices that failed test-mux.
-        # This is the PRIMARY FFmpeg strategy. The failed indices are streams
-        # that the Matroska muxer cannot write (corrupt MJPEG cover art, broken
-        # codec params). Excluding them by index is surgical and correct — unlike
-        # -map -0:t/-0:d which won't exclude streams mislabeled as "video".
-        # Note: we do NOT use the safe_indices allowlist because the test-mux
-        # with -t 1 incorrectly fails HEVC streams (large files take >1s to
-        # write cues), so safe_indices would exclude the main HEVC video track.
-        if _failed_indices:
-            _excl_maps: list[str] = ["-map", "0"]
-            for idx in _failed_indices:
-                _excl_maps += ["-map", f"-0:{idx}"]
+        # Strategy A: explicit per-index map (skips fonts/attachments entirely)
+        # This is the primary strategy and handles all anime MKVs with fonts.
+        if probe_ok and good_indices:
+            _map_args: list[str] = []
+            for idx in good_indices:
+                _map_args += ["-map", f"0:{idx}"]
             strategies.append(
-                _base + _excl_maps + ["-ignore_unknown", "-c", "copy"]
-                + meta_args + [output_path]
+                _base + _map_args + ["-c", "copy"]
+                + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
             )
 
-        # Strategy 4: FFmpeg -map 0 bare (last resort, may exit 183)
+        # Strategy B: specifier map (fallback if probe failed)
         strategies.append(
-            _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
-            + meta_args + [output_path]
+            _base
+            + ["-map", "0:V?", "-map", "0:a?", "-map", "0:s?"]
+            + ["-c", "copy"]
+            + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
         )
 
-        # ── 4. Execute strategies in order ────────────────────────────────────
+        # Strategy C: last resort — map all + ignore unknown
+        strategies.append(
+            _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
+            + meta_args + ["-progress", "pipe:1", "-nostats", output_path]
+        )
+
+        # ── 4. Try each strategy with progress bar ─────────────────────────────
+        file_size  = os.path.getsize(input_path)
+        start_time = time.time()
+        last_edit  = 0.0
+
+        async def _drain_progress(stdout) -> None:
+            nonlocal last_edit
+            out_time_us = 0
+            async for raw in stdout:
+                line = raw.decode(errors="replace").strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        out_time_us = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                now = time.time()
+                if (now - last_edit) < 5 or ms is None:
+                    continue
+                last_edit = now
+                elapsed = now - start_time
+                pct = min((out_time_us / total_us * 100) if total_us > 0 else 0, 99.9)
+                eta_str = "..."
+                if elapsed > 0 and pct > 0:
+                    eta_str = TimeFormatter(milliseconds=int((elapsed / pct) * (100 - pct) * 1000))
+                bar = "▣" * math.floor(pct / 5) + "▢" * (20 - math.floor(pct / 5))
+                try:
+                    await ms.edit(
+                        text=(
+                            f"🏷 Adding Metadata... ⚡\n\n{bar}\n\n"
+                            f"<b>📦 Size :</b>  {humanbytes(file_size)}\n"
+                            f"<b>✅ Done :</b>  {round(pct, 1)}%\n"
+                            f"<b>⏱ ETA :</b>   {eta_str}\n"
+                            f"<b>⏳ Time :</b>  {TimeFormatter(milliseconds=int(elapsed * 1000))}\n"
+                        ),
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("✖️ Cancel", callback_data="close")]]
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        proc = None
         stderr_txt = ""
-        last_rc = -1
         success = False
 
         for attempt, cmd in enumerate(strategies, 1):
-
-            if isinstance(cmd, dict) and cmd.get("type") == "mkvpropedit":
-                log.debug("[add_metadata] strategy {n}/{t}: mkvpropedit in-place",
-                          n=attempt, t=len(strategies))
-                try:
-                    import shutil as _shutil
-                    _shutil.copy2(cmd["input"], cmd["output"])
-                    _mkv_cmd = [cmd["binary"], cmd["output"]]
-                    _f = cmd["fields"]
-                    for _tag in ("title", "artist", "author", "comment"):
-                        _v = (_f.get(_tag) or "").strip()
-                        if _v:
-                            _mkv_cmd += ["--edit", "info", "--set", f"{_tag}={_v}"]
-                    for _tt, _tf in (("audio", "audio"), ("video", "video"), ("subtitles", "subtitle")):
-                        _v = (_f.get(_tf) or "").strip()
-                        if _v:
-                            _mkv_cmd += ["--edit", f"track:={_tt}", "--set", f"name={_v}"]
-                    _p = await asyncio.create_subprocess_exec(
-                        *_mkv_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _, _err = await _p.communicate()
-                    last_rc = _p.returncode
-                    if last_rc == 0 and os.path.exists(cmd["output"]) and os.path.getsize(cmd["output"]) > 0:
-                        log.debug("[add_metadata] strategy {n} (mkvpropedit) succeeded", n=attempt)
-                        output_path = cmd["output"]
-                        success = True
-                        break
-                    stderr_txt = _err.decode(errors="replace").strip()
-                    log.warning("[add_metadata] strategy {n} (mkvpropedit) failed (exit={rc})",
-                                n=attempt, rc=last_rc)
-                except FileNotFoundError:
-                    log.warning("[add_metadata] strategy {n}: mkvpropedit binary not found", n=attempt)
-                except Exception as _mpe:
-                    log.warning("[add_metadata] strategy {n} (mkvpropedit) error: {e}", n=attempt, e=_mpe)
-                continue
-
-            if isinstance(cmd, dict) and cmd.get("type") == "mutagen":
-                log.debug("[add_metadata] strategy {n}/{t}: mutagen pure-Python embed",
-                          n=attempt, t=len(strategies))
-                if _mutagen_embed(cmd["input"], cmd["output"], cmd["fields"]):
-                    output_path = cmd["output"]
-                    success = True
-                    break
-                log.warning("[add_metadata] strategy {n} (mutagen) failed", n=attempt)
-                continue
-
-            # FFmpeg command
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
                 except OSError:
                     pass
-            log.debug("[add_metadata] strategy {n}/{t}: {cmd}",
-                      n=attempt, t=len(strategies), cmd=" ".join(cmd))
+
+            log.debug(
+                "[add_metadata] strategy {n}/{t}: {cmd}",
+                n=attempt, t=len(strategies),
+                cmd=" ".join(cmd),
+            )
+
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _out, _err = await proc.communicate()
-            last_rc = proc.returncode
-            stderr_txt = _err.decode(errors="replace").strip()
+
+            # Drain stdout (progress) and stderr concurrently
+            _, stderr_bytes = await asyncio.gather(
+                _drain_progress(proc.stdout),
+                proc.stderr.read(),
+            )
+            await proc.wait()
+            stderr_txt = stderr_bytes.decode(errors="replace").strip()
+
             if stderr_txt:
-                log.debug(Msg.META_FFMPEG_STDERR, stderr=stderr_txt[-800:])
-            if last_rc == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                log.debug(Msg.META_FFMPEG_STDERR, stderr=stderr_txt[-600:])
+
+            if (
+                proc.returncode == 0
+                and os.path.exists(output_path)
+                and os.path.getsize(output_path) > 0
+            ):
                 log.debug("[add_metadata] strategy {n} succeeded", n=attempt)
                 success = True
                 break
-            log.warning("[add_metadata] strategy {n} failed (exit={rc}) — trying next",
-                        n=attempt, rc=last_rc)
+
+            log.warning(
+                "[add_metadata] strategy {n} failed (exit={rc}) — trying next",
+                n=attempt, rc=proc.returncode,
+            )
 
         if not success:
-            log.error(Msg.META_ERROR,
-                      error=f"all strategies failed. Last exit {last_rc}: {stderr_txt[-400:]}")
+            rc = proc.returncode if proc else -1
+            log.error(
+                Msg.META_ERROR,
+                error=f"all strategies failed. ffmpeg exit {rc}: {stderr_txt[-300:]}",
+            )
             await _safe_edit(ms, "❌ Metadata injection failed.")
             return None
 
-        # ── 5. Verify output ──────────────────────────────────────────────────
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            try:
-                _ffprobe = _find_binary("ffprobe")
-                _vp = await asyncio.create_subprocess_exec(
-                    _ffprobe, "-v", "quiet", "-print_format", "json",
-                    "-show_format", "-show_streams", output_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                _vout, _ = await _vp.communicate()
-                if _vp.returncode != 0 or not _vout:
-                    log.error(Msg.META_ERROR, error="verify: ffprobe failed")
-                    await _safe_edit(ms, "❌ Metadata verify failed.")
-                    return None
-                _vd = json.loads(_vout.decode(errors="replace"))
-                if not _vd.get("streams"):
-                    log.error(Msg.META_ERROR, error="verify: zero streams")
-                    await _safe_edit(ms, "❌ Metadata verify failed.")
-                    return None
-            except Exception as _ve:
-                log.error(Msg.META_ERROR, error=f"verify probe failed: {_ve}")
-                await _safe_edit(ms, "❌ Metadata verify failed.")
-                return None
-            await _safe_edit(ms, "✅ Metadata added.")
-            return output_path
-
-        log.error(Msg.META_ERROR, error="output file missing or empty after all strategies")
-        await _safe_edit(ms, "❌ Could not add metadata.")
-        return None
+        await _safe_edit(ms, "✅ Metadata added.")
+        return output_path
 
     except Exception as e:
         log.error(Msg.META_ERROR, error=e)
@@ -657,13 +413,15 @@ async def add_metadata(
 
 
 async def _safe_edit(ms, text: str) -> None:
-    if ms is None:
-        return
     try:
         await ms.edit(text)
     except Exception:
         pass
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# generate_sample_video — async subprocess, stream copy + re-encode fallback
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def generate_sample_video(
     input_path: str,
