@@ -13,11 +13,17 @@ pip install -r requirements.txt
 echo "==> Installing static FFmpeg into ./bin/"
 mkdir -p bin
 
-FFMPEG_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
 ARCHIVE="ffmpeg-static.tar.xz"
 
 echo "    Downloading FFmpeg static build..."
-curl -L "$FFMPEG_URL" -o "$ARCHIVE"
+# Primary: johnvansickle.com static build
+# Fallback: evermeet.cx (another reliable static build mirror)
+curl -L --fail --retry 3 --retry-delay 5 \
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+    -o "$ARCHIVE" \
+|| curl -L --fail --retry 3 --retry-delay 5 \
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+    -o "$ARCHIVE"
 
 echo "    Extracting..."
 mkdir -p _ffmpeg_tmp
