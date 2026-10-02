@@ -302,11 +302,22 @@ async def add_metadata(
             _probe_out, _ = await _probe_proc.communicate()
             if _probe_proc.returncode == 0 and _probe_out:
                 _streams = json.loads(_probe_out.decode(errors="replace")).get("streams", [])
-                _safe_indices = [
-                    s["index"] for s in _streams
-                    if s.get("codec_type") in _SAFE_CODEC_TYPES
-                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
-                ]
+                def _stream_is_safe(s: dict) -> bool:
+                    if s.get("codec_type") not in _SAFE_CODEC_TYPES:
+                        return False
+                    if s.get("codec_name", "none").lower() in _UNWRITABLE_CODECS:
+                        return False
+                    # Subtitle streams with 0 frames AND no extradata are ghost
+                    # streams in font-heavy anime MKVs — they cause exit 183 at
+                    # the muxer level even though codec_type looks safe.
+                    if s.get("codec_type") == "subtitle":
+                        nb_frames = int(s.get("nb_frames") or 0)
+                        extradata_size = int(s.get("extradata_size") or 0)
+                        if nb_frames == 0 and extradata_size == 0:
+                            return False
+                    return True
+
+                _safe_indices = [s["index"] for s in _streams if _stream_is_safe(s)]
                 _unsafe = [
                     s for s in _streams
                     if s.get("codec_type") not in _SAFE_CODEC_TYPES
