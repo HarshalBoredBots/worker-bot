@@ -80,7 +80,7 @@ def _bootstrap_ffmpeg() -> None:
             # Quick sanity check — a real xz archive starts with \xfd7zXZ
             with open(tmp.name, "rb") as f:
                 magic = f.read(6)
-            if magic[:5] != b"\xfd7zXZ\x00":
+            if magic[:6] != b"\xfd7zXZ\x00":
                 print(f"[bootstrap] Download from {url} is not a valid xz archive (got {magic!r}), trying next ...", flush=True)
                 os.unlink(tmp.name)
                 continue
