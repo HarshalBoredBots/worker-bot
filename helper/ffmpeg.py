@@ -296,6 +296,7 @@ async def add_metadata(
         # individually and keep only the ones that succeed.
         _UNWRITABLE_CODECS = {"none", "unknown", ""}
         _safe_indices: list[int] = []
+        _failed_indices: list[int] = []
         _has_unsafe_streams = False
         _streams: list[dict] = []
         try:
@@ -415,15 +416,22 @@ async def add_metadata(
 
         # ── Strategy ordering ────────────────────────────────────────────────
         #
-        # Priority: lossless in-place tag edits first, FFmpeg remux last.
-        # mkvpropedit/mutagen never touch streams — zero risk of dropping tracks.
-        # FFmpeg is a last resort only, and we use selective stream mapping
-        # (safe_indices from test-mux) to avoid exit 183 from broken attachment
-        # streams, while always preserving the main video/audio/subtitle tracks.
+        # The ONLY reliable way to handle these files is:
+        # 1. In-place tag editors (mkvpropedit, mutagen) — never touch streams.
+        # 2. FFmpeg with ONLY the streams that passed the test-mux — these are
+        #    empirically verified to remux without exit 183. We guard against
+        #    accidentally dropping the main video by checking _safe_indices
+        #    contains at least one video-type stream before using them.
+        # 3. FFmpeg excluding only the one specific stream index that failed
+        #    test-mux (stream 0 = corrupt MJPEG cover art in these files).
+        # 4. Fallbacks.
+        #
+        # We do NOT use -map 0 -map -0:d -map -0:t because the problem stream
+        # is typed as "video" by ffprobe (MJPEG cover art), so -0:t/-0:d don't
+        # exclude it. The only way to skip it is by explicit index exclusion.
 
         # Strategy 1: mkvpropedit — in-place tag edit, no remux (MKV only).
-        # Check binary exists BEFORE adding to list to avoid a 1.5 GB copy
-        # followed by "binary not found".
+        # Pre-check binary exists to avoid a 1.5 GB copy then "not found".
         _mkvpropedit_bin = _find_binary("mkvpropedit") if _input_ext == ".mkv" else None
         if _mkvpropedit_bin and os.path.isfile(_mkvpropedit_bin):
             strategies.append({
@@ -434,8 +442,7 @@ async def add_metadata(
             })
 
         # Strategy 2: mutagen — pure Python in-place embed.
-        # mutagen returns None for some MKVs (no native MKV tag support in easy
-        # mode), so we check up front and skip rather than copying 1.5 GB first.
+        # Pre-probe to skip files mutagen can't handle (returns None for many MKVs).
         _mutagen_supported = False
         try:
             from mutagen import File as _MF
@@ -450,16 +457,40 @@ async def add_metadata(
                 "fields": metadata_fields,
             })
 
-        # Strategy 3: FFmpeg -map 0 excluding data/attachment streams.
-        # Handles files where test-mux didn't run. Attachment streams (fonts)
-        # are what cause exit 183 — excluding them fixes most cases.
-        strategies.append(
-            _base + ["-map", "0", "-map", "-0:d", "-map", "-0:t",
-                     "-ignore_unknown", "-c", "copy"]
-            + meta_args + [output_path]
-        )
+        # Strategy 3: FFmpeg mapping only the streams that passed test-mux.
+        # These indices are empirically safe — the test-mux ran each one through
+        # a real Matroska write so exit 183 is impossible.
+        # Guard: only use if safe_indices includes at least one video stream,
+        # so we never produce a video-less output.
+        if _safe_indices:
+            _safe_has_video = any(
+                s.get("codec_type") == "video"
+                for s in _streams
+                if s.get("index") in _safe_indices
+            )
+            _all_has_video = any(s.get("codec_type") == "video" for s in _streams)
+            if _safe_has_video or not _all_has_video:
+                _explicit_maps: list[str] = []
+                for idx in _safe_indices:
+                    _explicit_maps += ["-map", f"0:{idx}"]
+                strategies.append(
+                    _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
+                    + meta_args + [output_path]
+                )
 
-        # Strategy 4: bare -map 0 (absolute last resort, may exit 183)
+        # Strategy 4: FFmpeg excluding ONLY the failed stream indices by number.
+        # More surgical than -map -0:t/-0:d — removes the exact corrupt streams
+        # that cause exit 183 regardless of their codec_type label.
+        if _failed_indices:
+            _excl_maps: list[str] = ["-map", "0"]
+            for idx in _failed_indices:
+                _excl_maps += ["-map", f"-0:{idx}"]
+            strategies.append(
+                _base + _excl_maps + ["-ignore_unknown", "-c", "copy"]
+                + meta_args + [output_path]
+            )
+
+        # Strategy 5: FFmpeg -map 0 bare (last resort, may exit 183)
         strategies.append(
             _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
             + meta_args + [output_path]
