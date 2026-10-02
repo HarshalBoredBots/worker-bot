@@ -302,28 +302,36 @@ async def add_metadata(
             _probe_out, _ = await _probe_proc.communicate()
             if _probe_proc.returncode == 0 and _probe_out:
                 _streams = json.loads(_probe_out.decode(errors="replace")).get("streams", [])
-                def _stream_is_safe(s: dict) -> bool:
-                    if s.get("codec_type") not in _SAFE_CODEC_TYPES:
-                        return False
-                    if s.get("codec_name", "none").lower() in _UNWRITABLE_CODECS:
-                        return False
-                    # Subtitle streams with 0 frames AND no extradata are ghost
-                    # streams in font-heavy anime MKVs — they cause exit 183 at
-                    # the muxer level even though codec_type looks safe.
-                    if s.get("codec_type") == "subtitle":
-                        nb_frames = int(s.get("nb_frames") or 0)
-                        extradata_size = int(s.get("extradata_size") or 0)
-                        if nb_frames == 0 and extradata_size == 0:
-                            return False
-                    return True
-
-                _safe_indices = [s["index"] for s in _streams if _stream_is_safe(s)]
+                # video+audio only — subtitle streams in font-heavy anime MKVs
+                # frequently have internally corrupt codec parameters that cause
+                # FFmpeg exit 183 at the muxer level even when ffprobe reports
+                # them as a known codec type. Excluding all subtitles from the
+                # explicit-map strategy is safe: we are only embedding tags, not
+                # changing playback content.
+                _VA_ONLY = {"video", "audio"}
+                _safe_indices = [
+                    s["index"] for s in _streams
+                    if s.get("codec_type") in _VA_ONLY
+                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
+                ]
+                # Keep full safe list (v+a+s) for the subtitle-metadata arg
+                # decision; used only for logging below.
+                _safe_indices_full = [
+                    s["index"] for s in _streams
+                    if s.get("codec_type") in _SAFE_CODEC_TYPES
+                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
+                ]
                 _unsafe = [
                     s for s in _streams
                     if s.get("codec_type") not in _SAFE_CODEC_TYPES
                     or s.get("codec_name", "none").lower() in _UNWRITABLE_CODECS
                 ]
-                _has_unsafe_streams = bool(_unsafe)
+                # Treat files with any subtitle streams as "has unsafe" so
+                # strategy 1 always uses the explicit video+audio-only map.
+                _has_subtitle_streams = any(
+                    s.get("codec_type") == "subtitle" for s in _streams
+                )
+                _has_unsafe_streams = bool(_unsafe) or _has_subtitle_streams
                 if _has_unsafe_streams:
                     _unsafe_desc = [
                         f"{s.get('codec_type','?')}:{s.get('codec_name','?')} @idx{s.get('index','?')}"
@@ -367,14 +375,22 @@ async def add_metadata(
         strategies: list = []
 
         if _has_unsafe_streams and _safe_indices:
-            # Strategy 1: Explicit per-index map — only copy safe streams.
-            # Root fix: never passes unsafe streams to FFmpeg's muxer at all.
+            # Strategy 1: Map video+audio streams only — subtitles excluded.
+            # Subtitle streams in font-heavy anime MKVs cause exit 183 even
+            # when their codec_type looks valid; dropping them entirely is safe
+            # because we are only embedding container-level tags.
             _explicit_maps: list[str] = []
             for idx in _safe_indices:
                 _explicit_maps += ["-map", f"0:{idx}"]
+            # Drop -metadata:s:s when no subtitle streams are mapped
+            _meta_args_no_sub = [
+                a for i, a in enumerate(meta_args)
+                if not (a == "-metadata:s:s" or
+                        (i > 0 and meta_args[i - 1] == "-metadata:s:s"))
+            ]
             strategies.append(
                 _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
-                + meta_args + [output_path]
+                + _meta_args_no_sub + [output_path]
             )
             # Strategy 2: mkvpropedit — zero-remux, cannot produce exit 183.
             strategies.append({
