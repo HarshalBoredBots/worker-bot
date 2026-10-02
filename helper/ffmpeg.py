@@ -316,22 +316,25 @@ async def add_metadata(
                 ]
                 _has_unsafe_streams = len(_all_indices) < len(_streams)
 
-            # Step B: test-mux each candidate index into a null sink.
-            # A 0-frame null mux takes <100 ms and tells us definitively whether
-            # the muxer can write the stream's codec parameters.
+            # Step B: test-mux each candidate index into a Matroska pipe sink.
+            # MUST use "-f matroska" not "-f null": the null muxer skips codec
+            # parameter validation and gives false positives for streams that
+            # the real Matroska muxer will reject with exit 183.
+            # Piping to /dev/null avoids writing any bytes to disk while still
+            # exercising the full MKV container header write path.
             async def _test_stream(idx: int) -> bool:
                 _tp = await asyncio.create_subprocess_exec(
                     _ffmpeg, "-y",
                     "-probesize", "100M", "-analyzeduration", "100M",
                     "-i", input_path,
                     "-map", f"0:{idx}",
-                    "-frames:v", "0", "-frames:a", "0",
                     "-c", "copy",
-                    "-f", "null", "/dev/null",
+                    "-f", "matroska", "pipe:1",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await _tp.communicate()
+                # exit 0 = muxer accepted codec params; any other = reject
                 return _tp.returncode == 0
 
             _test_results = await asyncio.gather(
