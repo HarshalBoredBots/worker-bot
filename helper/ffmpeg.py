@@ -280,17 +280,20 @@ async def add_metadata(
     try:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-        # ── 1. Probe all streams ──────────────────────────────────────────────
-        # A stream is "writable" only if:
-        #   (a) its codec_type is in _SAFE_CODEC_TYPES  (video/audio/subtitle)
-        #   (b) its codec_name is NOT "none" or "unknown" — streams that ffprobe
-        #       reports as safe-type but with no actual codec (e.g. broken subtitle
-        #       track 0:9 in these MKVs) still cause exit 183 at the muxer level.
+        # ── 1. Discover writable stream indices via test-mux ─────────────────
+        # ffprobe codec_type is unreliable for these anime MKVs: streams that
+        # report as video/audio/subtitle still cause exit 183 at the Matroska
+        # muxer level due to corrupt internal codec parameters.  The only
+        # trustworthy method is to attempt a zero-frame null mux of each stream
+        # individually and keep only the ones that succeed.
         _UNWRITABLE_CODECS = {"none", "unknown", ""}
         _safe_indices: list[int] = []
         _has_unsafe_streams = False
         try:
             _ffprobe = _find_binary("ffprobe")
+            _ffmpeg  = _find_binary("ffmpeg")
+
+            # Step A: get all stream indices from ffprobe
             _probe_proc = await asyncio.create_subprocess_exec(
                 _ffprobe, "-v", "quiet",
                 "-print_format", "json",
@@ -300,55 +303,61 @@ async def add_metadata(
                 stderr=asyncio.subprocess.DEVNULL,
             )
             _probe_out, _ = await _probe_proc.communicate()
+            _all_indices: list[int] = []
             if _probe_proc.returncode == 0 and _probe_out:
                 _streams = json.loads(_probe_out.decode(errors="replace")).get("streams", [])
-                # video+audio only — subtitle streams in font-heavy anime MKVs
-                # frequently have internally corrupt codec parameters that cause
-                # FFmpeg exit 183 at the muxer level even when ffprobe reports
-                # them as a known codec type. Excluding all subtitles from the
-                # explicit-map strategy is safe: we are only embedding tags, not
-                # changing playback content.
-                _VA_ONLY = {"video", "audio"}
-                _safe_indices = [
+                # Pre-filter: skip pure attachment/data streams (fonts, chapters)
+                # — these are never writable and would just slow down the test loop.
+                _SKIP_TYPES = {"attachment", "data"}
+                _all_indices = [
                     s["index"] for s in _streams
-                    if s.get("codec_type") in _VA_ONLY
+                    if s.get("codec_type") not in _SKIP_TYPES
                     and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
                 ]
-                # Keep full safe list (v+a+s) for the subtitle-metadata arg
-                # decision; used only for logging below.
-                _safe_indices_full = [
-                    s["index"] for s in _streams
-                    if s.get("codec_type") in _SAFE_CODEC_TYPES
-                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
-                ]
-                _unsafe = [
-                    s for s in _streams
-                    if s.get("codec_type") not in _SAFE_CODEC_TYPES
-                    or s.get("codec_name", "none").lower() in _UNWRITABLE_CODECS
-                ]
-                # Treat files with any subtitle streams as "has unsafe" so
-                # strategy 1 always uses the explicit video+audio-only map.
-                _has_subtitle_streams = any(
-                    s.get("codec_type") == "subtitle" for s in _streams
+                _has_unsafe_streams = len(_all_indices) < len(_streams)
+
+            # Step B: test-mux each candidate index into a null sink.
+            # A 0-frame null mux takes <100 ms and tells us definitively whether
+            # the muxer can write the stream's codec parameters.
+            async def _test_stream(idx: int) -> bool:
+                _tp = await asyncio.create_subprocess_exec(
+                    _ffmpeg, "-y",
+                    "-probesize", "100M", "-analyzeduration", "100M",
+                    "-i", input_path,
+                    "-map", f"0:{idx}",
+                    "-frames:v", "0", "-frames:a", "0",
+                    "-c", "copy",
+                    "-f", "null", "/dev/null",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
-                _has_unsafe_streams = bool(_unsafe) or _has_subtitle_streams
-                if _has_unsafe_streams:
-                    _unsafe_desc = [
-                        f"{s.get('codec_type','?')}:{s.get('codec_name','?')} @idx{s.get('index','?')}"
-                        for s in _unsafe
-                    ]
-                    log.warning(
-                        "[add_metadata] {n} unwritable stream(s) — "
-                        "using index-explicit map to avoid exit 183: {desc}",
-                        n=len(_unsafe),
-                        desc=", ".join(_unsafe_desc),
-                    )
-                log.debug(
-                    "[add_metadata] safe stream indices to copy: {idxs}",
-                    idxs=_safe_indices,
+                await _tp.communicate()
+                return _tp.returncode == 0
+
+            _test_results = await asyncio.gather(
+                *[_test_stream(i) for i in _all_indices]
+            )
+            _safe_indices = [
+                idx for idx, ok in zip(_all_indices, _test_results) if ok
+            ]
+            _failed_indices = [
+                idx for idx, ok in zip(_all_indices, _test_results) if not ok
+            ]
+
+            if _failed_indices:
+                _has_unsafe_streams = True
+                log.warning(
+                    "[add_metadata] test-mux: {n} stream(s) failed null-mux "
+                    "and will be excluded: indices {bad}",
+                    n=len(_failed_indices),
+                    bad=_failed_indices,
                 )
+            log.debug(
+                "[add_metadata] test-mux writable stream indices: {idxs}",
+                idxs=_safe_indices,
+            )
         except Exception as _pe:
-            log.warning("[add_metadata] probe error: {err}", err=_pe)
+            log.warning("[add_metadata] probe/test-mux error: {err}", err=_pe)
 
         # ── 2. Build metadata tag args ────────────────────────────────────────
         meta_args: list[str] = []
@@ -375,22 +384,15 @@ async def add_metadata(
         strategies: list = []
 
         if _has_unsafe_streams and _safe_indices:
-            # Strategy 1: Map video+audio streams only — subtitles excluded.
-            # Subtitle streams in font-heavy anime MKVs cause exit 183 even
-            # when their codec_type looks valid; dropping them entirely is safe
-            # because we are only embedding container-level tags.
+            # Strategy 1: Map only streams confirmed writable by test-mux.
+            # These indices are empirically verified — no guessing from
+            # codec_type or codec_name which are unreliable for anime MKVs.
             _explicit_maps: list[str] = []
             for idx in _safe_indices:
                 _explicit_maps += ["-map", f"0:{idx}"]
-            # Drop -metadata:s:s when no subtitle streams are mapped
-            _meta_args_no_sub = [
-                a for i, a in enumerate(meta_args)
-                if not (a == "-metadata:s:s" or
-                        (i > 0 and meta_args[i - 1] == "-metadata:s:s"))
-            ]
             strategies.append(
                 _base + _explicit_maps + ["-ignore_unknown", "-c", "copy"]
-                + _meta_args_no_sub + [output_path]
+                + meta_args + [output_path]
             )
             # Strategy 2: mkvpropedit — zero-remux, cannot produce exit 183.
             strategies.append({
