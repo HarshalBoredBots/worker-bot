@@ -130,113 +130,12 @@ _bootstrap_ffmpeg()
 
 def _bootstrap_mkvtoolnix() -> None:
     """
-    Download a static mkvpropedit binary at dyno startup.
-    mkvpropedit edits MKV tags IN-PLACE without remuxing any streams —
-    this is the only reliable way to add metadata to MKVs that have
-    broken attachment streams (font/sfnt) that cause FFmpeg exit 183.
+    MKV tag editing is now handled by mutagen (pure-Python, always available).
+    mkvpropedit binary download has been removed — mkvtoolnix.download no
+    longer hosts static Linux tarballs at predictable URLs.
+    This stub is kept so any external callers don't break.
     """
-    import os
-    import tarfile
-    import tempfile
-    import urllib.request
-
-    bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
-    mkvpropedit_path = os.path.join(bin_dir, "mkvpropedit")
-
-    if os.path.isfile(mkvpropedit_path) and os.access(mkvpropedit_path, os.X_OK):
-        print(f"[bootstrap] mkvpropedit already present at {mkvpropedit_path}", flush=True)
-        return
-
-    os.makedirs(bin_dir, exist_ok=True)
-
-    # mkvtoolnix.download keeps only the CURRENT release tarball, so the version
-    # in the URL goes stale quickly.  We discover the live version first by
-    # scraping the directory index, then fall back to a wide static list.
-    import re as _re
-
-    def _discover_mkvtoolnix_urls() -> list:
-        """Return candidate URLs, newest-first, by scraping the download index."""
-        try:
-            index_url = "https://mkvtoolnix.download/linux/"
-            with urllib.request.urlopen(index_url, timeout=10) as _r:
-                _html = _r.read().decode(errors="replace")
-            # Find all 64-bit tarball filenames in the directory listing
-            _found = _re.findall(
-                r'mkvtoolnix-64bit-([\d.]+)\.tar\.xz', _html
-            )
-            # Sort by version descending (numeric tuple sort)
-            def _ver(v):
-                try:
-                    return tuple(int(x) for x in v.split("."))
-                except Exception:
-                    return (0,)
-            _sorted = sorted(set(_found), key=_ver, reverse=True)
-            return [
-                f"https://mkvtoolnix.download/linux/mkvtoolnix-64bit-{v}.tar.xz"
-                for v in _sorted
-            ]
-        except Exception as _de:
-            print(f"[bootstrap] mkvtoolnix index discovery failed: {_de}", flush=True)
-            return []
-
-    # Combine discovered URLs with a wide static fallback list
-    # (covers recent releases in case the index scrape fails)
-    _static_fallback = [
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-90.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-89.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-88.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-87.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-86.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-85.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-84.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-83.0.tar.xz",
-        "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-82.0.tar.xz",
-    ]
-    _discovered = _discover_mkvtoolnix_urls()
-    # Merge: discovered first (newest live version at the top), then static fallbacks
-    # De-duplicate while preserving order
-    _seen = set()
-    STATIC_URLS = []
-    for _u in _discovered + _static_fallback:
-        if _u not in _seen:
-            _seen.add(_u)
-            STATIC_URLS.append(_u)
-
-    for url in STATIC_URLS:
-        try:
-            print(f"[bootstrap] Downloading mkvtoolnix from {url} ...", flush=True)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.xz")
-            tmp.close()
-            urllib.request.urlretrieve(url, tmp.name)
-            with open(tmp.name, "rb") as f:
-                magic = f.read(6)
-            if magic[:6] != b"\xfd7zXZ\x00":
-                print(f"[bootstrap] mkvtoolnix download not valid xz, skipping.", flush=True)
-                os.unlink(tmp.name)
-                continue
-            print(f"[bootstrap] mkvtoolnix download OK ({os.path.getsize(tmp.name)} bytes)", flush=True)
-            with tarfile.open(tmp.name, "r:xz") as tar:
-                for member in tar.getmembers():
-                    if os.path.basename(member.name) == "mkvpropedit" and member.isfile():
-                        with tar.extractfile(member) as src, open(mkvpropedit_path, "wb") as dst:
-                            dst.write(src.read())
-                        os.chmod(mkvpropedit_path, 0o755)
-                        print(f"[bootstrap] Extracted mkvpropedit → {mkvpropedit_path}", flush=True)
-                        break
-            os.unlink(tmp.name)
-            if os.path.isfile(mkvpropedit_path):
-                break
-        except Exception as exc:
-            print(f"[bootstrap] mkvtoolnix download failed: {exc}", flush=True)
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
-
-    if not os.path.isfile(mkvpropedit_path):
-        print("[bootstrap] WARNING: mkvpropedit not available — FFmpeg fallback will be used.", flush=True)
-    else:
-        print(f"[bootstrap] mkvpropedit ready at {mkvpropedit_path}", flush=True)
+    print("[bootstrap] MKV metadata: using mutagen (pure-Python, no binary needed)", flush=True)
 
 
 _bootstrap_mkvtoolnix()
