@@ -374,36 +374,22 @@ class JobPipeline:
                         job_id, pct, humanbytes(int(spd)),
                     )
 
-                if base_type == "document":
-                    async def _ul_coro():
-                        return await self._bot.send_document(
-                            out_channel,
-                            document=file_path,
-                            file_name=final_name,
-                            thumb=thumb_path,
-                            caption=_cap,
-                            progress=_ul_progress,
-                        )
-                elif base_type == "video":
-                    async def _ul_coro():
-                        return await self._bot.send_video(
-                            out_channel,
-                            video=file_path,
-                            thumb=thumb_path,
-                            caption=_cap,
-                            duration=int(duration) if duration else None,
-                            progress=_ul_progress,
-                        )
-                else:
-                    async def _ul_coro():
-                        return await self._bot.send_audio(
-                            out_channel,
-                            audio=file_path,
-                            thumb=thumb_path,
-                            caption=_cap,
-                            duration=int(duration) if duration else None,
-                            progress=_ul_progress,
-                        )
+                # Always upload as send_document regardless of base_type.
+                # send_video / send_audio tell Telegram to process (and
+                # potentially re-encode) the file server-side, which destroys
+                # quality (HEVC → mjpeg, 1080p → 360p, 1.33 GB → 277 MB).
+                # send_document uploads raw bytes untouched — the filename
+                # extension (.mkv, .mp4, .mp3 …) still shows the correct type
+                # in Telegram clients, and quality is 100% preserved.
+                async def _ul_coro():
+                    return await self._bot.send_document(
+                        out_channel,
+                        document=file_path,
+                        file_name=final_name,
+                        thumb=thumb_path,
+                        caption=_cap,
+                        progress=_ul_progress,
+                    )
 
                 sent = await upload_with_floodwait(_ul_coro, job_id=job_id, status_msg=None)
 
@@ -561,36 +547,22 @@ class JobPipeline:
                         job_id, pct, humanbytes(int(spd)),
                     )
 
-                if base_type == "document":
-                    async def _ul_coro():
-                        return await self._bot.send_document(
-                            out_channel,
-                            document=file_path,
-                            file_name=final_name,
-                            thumb=thumb_path,
-                            caption=caption,
-                            progress=_ul_progress,
-                        )
-                elif base_type == "video":
-                    async def _ul_coro():
-                        return await self._bot.send_video(
-                            out_channel,
-                            video=file_path,
-                            thumb=thumb_path,
-                            caption=caption,
-                            duration=int(duration) if duration else None,
-                            progress=_ul_progress,
-                        )
-                else:
-                    async def _ul_coro():
-                        return await self._bot.send_audio(
-                            out_channel,
-                            audio=file_path,
-                            thumb=thumb_path,
-                            caption=caption,
-                            duration=int(duration) if duration else None,
-                            progress=_ul_progress,
-                        )
+                # Always upload as send_document regardless of base_type.
+                # send_video / send_audio tell Telegram to process (and
+                # potentially re-encode) the file server-side, which destroys
+                # quality (HEVC → mjpeg, 1080p → 360p, 1.33 GB → 277 MB).
+                # send_document uploads raw bytes untouched — the filename
+                # extension (.mkv, .mp4, .mp3 …) still shows the correct type
+                # in Telegram clients, and quality is 100% preserved.
+                async def _ul_coro():
+                    return await self._bot.send_document(
+                        out_channel,
+                        document=file_path,
+                        file_name=final_name,
+                        thumb=thumb_path,
+                        caption=caption,
+                        progress=_ul_progress,
+                    )
 
                 sent = await upload_with_floodwait(_ul_coro, job_id=job_id, status_msg=None)
 

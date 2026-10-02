@@ -204,6 +204,14 @@ def _find_binary(name: str) -> str:
     if os.path.isfile(local) and os.access(local, os.X_OK):
         return local
     found = _shutil.which(name)
+    if found:
+        log.warning(
+            "[ffmpeg] WARNING: static ./bin/{name} not found — falling back to "
+            "system {name} at {path}. This may be too old to handle HEVC/H.265 "
+            "and will produce degraded output. Ensure build.sh ran successfully "
+            "on deploy so ./bin/{name} is installed.",
+            name=name, path=found,
+        )
     return found or name
 
 
