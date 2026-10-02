@@ -1,0 +1,45 @@
+# render.yaml — Render deployment configuration
+# Deployment type: Docker (authoritative — see Dockerfile)
+# build.sh is NOT used in Docker mode; FFmpeg is installed via apt in Dockerfile.
+#
+# IMPORTANT: Set all environment variables in the Render dashboard.
+# Never commit secrets to this file.
+
+services:
+  - type: web
+    name: worker-renamebot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # ── REQUIRED secrets — set in Render dashboard, never here ──────────
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: WORKER_CONTROL_GROUP_ID
+        sync: false
+      - key: WORKER_OUTPUT_CHANNEL_ID
+        sync: false
+
+      # ── Optional / tunable ───────────────────────────────────────────────
+      - key: WORKER_ID
+        value: worker_01
+      - key: WORKER_CONCURRENCY
+        value: "3"
+      - key: HEARTBEAT_INTERVAL
+        value: "30"
+      - key: WORKER_OFFLINE_TIMEOUT
+        value: "120"
+      - key: SHUTDOWN_GRACE_SECONDS
+        value: "60"
+      - key: DB_NAME
+        value: DistributedRenameBot
+      - key: PORT
+        value: "8015"
+      - key: IMGBB_API_KEY
+        sync: false

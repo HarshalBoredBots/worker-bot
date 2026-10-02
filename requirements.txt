@@ -1,0 +1,20 @@
+# ── Telegram ──────────────────────────────────────────────────────────────────
+pyrogram==2.0.106
+TgCrypto
+
+# ── Database ──────────────────────────────────────────────────────────────────
+motor
+dnspython
+
+# ── Media processing ──────────────────────────────────────────────────────────
+# ffmpeg-python removed — helper/ffmpeg.py uses asyncio.create_subprocess_exec
+# directly, so no Python ffmpeg wrapper is needed.
+Pillow
+hachoir
+
+# ── HTTP / async I/O ─────────────────────────────────────────────────────────
+aiohttp
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pytz
+psutil
