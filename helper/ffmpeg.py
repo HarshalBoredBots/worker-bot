@@ -413,38 +413,57 @@ async def add_metadata(
         ]
         strategies: list = []
 
-        # ── Strategy ordering: safe, lossless methods first ──────────────────
-        # mkvpropedit edits tags IN-PLACE (file copy then tag patch) — it never
-        # touches streams so it cannot drop a single track.  mutagen is the same.
-        # FFmpeg remux is only used as a last resort because it re-muxes all
-        # streams and the test-mux logic can incorrectly exclude the main video
-        # track (e.g. HEVC on older ffmpeg builds), producing a shrunken output.
+        # ── Strategy ordering ────────────────────────────────────────────────
+        #
+        # Priority: lossless in-place tag edits first, FFmpeg remux last.
+        # mkvpropedit/mutagen never touch streams — zero risk of dropping tracks.
+        # FFmpeg is a last resort only, and we use selective stream mapping
+        # (safe_indices from test-mux) to avoid exit 183 from broken attachment
+        # streams, while always preserving the main video/audio/subtitle tracks.
 
-        # Strategy 1: mkvpropedit — zero-remux, in-place tag edit (MKV only).
-        if _input_ext == ".mkv":
+        # Strategy 1: mkvpropedit — in-place tag edit, no remux (MKV only).
+        # Check binary exists BEFORE adding to list to avoid a 1.5 GB copy
+        # followed by "binary not found".
+        _mkvpropedit_bin = _find_binary("mkvpropedit") if _input_ext == ".mkv" else None
+        if _mkvpropedit_bin and os.path.isfile(_mkvpropedit_bin):
             strategies.append({
                 "type": "mkvpropedit",
-                "binary": _find_binary("mkvpropedit"),
+                "binary": _mkvpropedit_bin,
                 "input": input_path, "output": output_path,
                 "fields": metadata_fields,
             })
 
-        # Strategy 2: mutagen — pure Python, in-place, no binary dependency.
-        strategies.append({
-            "type": "mutagen",
-            "input": input_path, "output": output_path,
-            "fields": metadata_fields,
-        })
+        # Strategy 2: mutagen — pure Python in-place embed.
+        # mutagen returns None for some MKVs (no native MKV tag support in easy
+        # mode), so we check up front and skip rather than copying 1.5 GB first.
+        _mutagen_supported = False
+        try:
+            from mutagen import File as _MF
+            _mf_probe = _MF(input_path, easy=True)
+            _mutagen_supported = _mf_probe is not None
+        except Exception:
+            pass
+        if _mutagen_supported:
+            strategies.append({
+                "type": "mutagen",
+                "input": input_path, "output": output_path,
+                "fields": metadata_fields,
+            })
 
-        # Strategy 3: FFmpeg with -map 0 (ALL streams, no exclusions).
-        # Never uses selective stream mapping so no tracks can be dropped.
+        # Strategy 3: FFmpeg -map 0 excluding data/attachment streams.
+        # Handles files where test-mux didn't run. Attachment streams (fonts)
+        # are what cause exit 183 — excluding them fixes most cases.
+        strategies.append(
+            _base + ["-map", "0", "-map", "-0:d", "-map", "-0:t",
+                     "-ignore_unknown", "-c", "copy"]
+            + meta_args + [output_path]
+        )
+
+        # Strategy 4: bare -map 0 (absolute last resort, may exit 183)
         strategies.append(
             _base + ["-map", "0", "-ignore_unknown", "-c", "copy"]
             + meta_args + [output_path]
         )
-
-        # Strategy 4: bare stream copy (absolute last resort)
-        strategies.append(_base + ["-c", "copy"] + meta_args + [output_path])
 
         # ── 4. Execute strategies in order ────────────────────────────────────
         stderr_txt = ""
