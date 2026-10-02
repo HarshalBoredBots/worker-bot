@@ -340,7 +340,51 @@ async def add_metadata(
             import tempfile as _tempfile
             _tmp_dir = os.path.dirname(os.path.abspath(output_path))
 
+            # Build a lookup: index → codec_type, codec_name
+            _idx_info: dict[int, dict] = {
+                s["index"]: s for s in _streams if "index" in s
+            }
+
             async def _test_stream(idx: int) -> bool:
+                """
+                Test whether stream idx can be muxed into a Matroska container.
+
+                Key constraints:
+                  - HEVC/H.265 video in large files requires >1s to write cues.
+                    With -t 1 the test always fails for HEVC even when the stream
+                    is perfectly fine.  We use -t 10 for video streams so the cues
+                    index has time to flush.
+                  - We NEVER exclude a stream whose codec_type is "video" based
+                    solely on a failed test-mux: a false negative here drops the
+                    entire main video track (the 1.4 GB HEVC stream), turning a
+                    1.46 GB file into a 280 MB audio-only output.
+                  - For audio/subtitle streams -t 3 is plenty.
+                  - Attachment/data streams are pre-filtered by _SKIP_TYPES above
+                    and never reach this function.
+                """
+                _info     = _idx_info.get(idx, {})
+                _ctype    = _info.get("codec_type", "")
+                _cname    = _info.get("codec_name", "").lower()
+
+                # SAFETY: never test-fail a main video stream.
+                # These are the codecs that need long cue-write time in MKV.
+                # We declare them writable without testing — if they genuinely
+                # can't be muxed, FFmpeg will still report exit 183 in strategy 3/4.
+                _SLOW_VIDEO_CODECS = {
+                    "hevc", "h265", "h264", "avc", "av1", "vp9", "vp8",
+                    "mpeg4", "mpeg2video", "theora",
+                }
+                if _ctype == "video" and _cname in _SLOW_VIDEO_CODECS:
+                    log.debug(
+                        "[add_metadata] test-mux: skipping test for video stream %d (%s) — "
+                        "declared writable (slow-cue codec)",
+                        idx, _cname,
+                    )
+                    return True
+
+                # For video we still test but give it 10 s; audio/sub get 3 s.
+                _t = "10" if _ctype == "video" else "3"
+
                 _tmp = os.path.join(_tmp_dir, f"_testmux_{idx}_{os.getpid()}.mkv")
                 try:
                     _tp = await asyncio.create_subprocess_exec(
@@ -348,16 +392,28 @@ async def add_metadata(
                         "-probesize", "100M", "-analyzeduration", "100M",
                         "-i", input_path,
                         "-map", f"0:{idx}",
-                        "-t", "1",
+                        "-t", _t,
                         "-c", "copy",
                         "-f", "matroska", _tmp,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
                     await _tp.communicate()
-                    return _tp.returncode == 0 and os.path.exists(_tmp) and os.path.getsize(_tmp) > 0
+                    ok = _tp.returncode == 0 and os.path.exists(_tmp) and os.path.getsize(_tmp) > 0
+                    # Extra safety: never mark a video stream as failed.
+                    # Even if -t 10 isn't enough for some exotic encoder, we'd
+                    # rather try to include it and let FFmpeg handle the error.
+                    if not ok and _ctype == "video":
+                        log.warning(
+                            "[add_metadata] test-mux: video stream %d (%s) failed "
+                            "test-mux but will NOT be excluded (video safety rule)",
+                            idx, _cname,
+                        )
+                        return True
+                    return ok
                 except Exception:
-                    return False
+                    # On exception, be conservative: keep video, drop others.
+                    return _ctype == "video"
                 finally:
                     try:
                         if os.path.exists(_tmp):
