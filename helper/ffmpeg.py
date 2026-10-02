@@ -281,6 +281,12 @@ async def add_metadata(
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
         # ── 1. Probe all streams ──────────────────────────────────────────────
+        # A stream is "writable" only if:
+        #   (a) its codec_type is in _SAFE_CODEC_TYPES  (video/audio/subtitle)
+        #   (b) its codec_name is NOT "none" or "unknown" — streams that ffprobe
+        #       reports as safe-type but with no actual codec (e.g. broken subtitle
+        #       track 0:9 in these MKVs) still cause exit 183 at the muxer level.
+        _UNWRITABLE_CODECS = {"none", "unknown", ""}
         _safe_indices: list[int] = []
         _has_unsafe_streams = False
         try:
@@ -299,17 +305,29 @@ async def add_metadata(
                 _safe_indices = [
                     s["index"] for s in _streams
                     if s.get("codec_type") in _SAFE_CODEC_TYPES
+                    and s.get("codec_name", "none").lower() not in _UNWRITABLE_CODECS
                 ]
-                _unsafe = [s for s in _streams if s.get("codec_type") not in _SAFE_CODEC_TYPES]
+                _unsafe = [
+                    s for s in _streams
+                    if s.get("codec_type") not in _SAFE_CODEC_TYPES
+                    or s.get("codec_name", "none").lower() in _UNWRITABLE_CODECS
+                ]
                 _has_unsafe_streams = bool(_unsafe)
                 if _has_unsafe_streams:
-                    _unsafe_types = {s.get("codec_type", "unknown") for s in _unsafe}
+                    _unsafe_desc = [
+                        f"{s.get('codec_type','?')}:{s.get('codec_name','?')} @idx{s.get('index','?')}"
+                        for s in _unsafe
+                    ]
                     log.warning(
-                        "[add_metadata] {n} unsafe stream(s) ({types}) — "
-                        "using index-explicit map to avoid exit 183",
+                        "[add_metadata] {n} unwritable stream(s) — "
+                        "using index-explicit map to avoid exit 183: {desc}",
                         n=len(_unsafe),
-                        types=", ".join(sorted(_unsafe_types)),
+                        desc=", ".join(_unsafe_desc),
                     )
+                log.debug(
+                    "[add_metadata] safe stream indices to copy: {idxs}",
+                    idxs=_safe_indices,
+                )
         except Exception as _pe:
             log.warning("[add_metadata] probe error: {err}", err=_pe)
 
