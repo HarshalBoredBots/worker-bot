@@ -92,6 +92,7 @@ class JobPipeline:
         rename_pattern    = task.get("rename_pattern", "")
         prefix            = task.get("prefix", "")
         suffix            = task.get("suffix", "")
+        upload_as         = task.get("upload_as", "document")   # NEW
         metadata = {
             "title":    "@Animes_Ocean",
             "artist":   "@Animes_Ocean",
@@ -296,8 +297,8 @@ class JobPipeline:
                 _cap = f"<b>{final_name}</b>"
                 await self._send_state(job_id, STATE_UPLOADING)
                 logger.info(
-                    "[pipeline] job=%s UPLOADING  type=document  size=%s",
-                    job_id, humanbytes(actual_size),
+                    "[pipeline] job=%s UPLOADING  type=%s  size=%s",
+                    job_id, upload_as, humanbytes(actual_size),
                 )
 
                 last_prog_edit[0] = 0.0
@@ -314,17 +315,37 @@ class JobPipeline:
                         job_id, pct, humanbytes(int(spd)),
                     )
 
-                # Always send_document: preserves raw bytes without Telegram
-                # server-side re-encode (send_video causes quality destruction).
                 async def _ul_coro():
-                    return await self._bot.send_document(
-                        out_channel,
-                        document=file_path,
-                        file_name=final_name,
-                        thumb=thumb_path,
-                        caption=_cap,
-                        progress=_ul_progress,
-                    )
+                    if upload_as == "video":
+                        return await self._bot.send_video(
+                            out_channel,
+                            video=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=_cap,
+                            duration=duration,
+                            supports_streaming=True,
+                            progress=_ul_progress,
+                        )
+                    elif upload_as == "audio":
+                        return await self._bot.send_audio(
+                            out_channel,
+                            audio=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=_cap,
+                            duration=duration,
+                            progress=_ul_progress,
+                        )
+                    else:   # "document" — default, safe, no re-encode
+                        return await self._bot.send_document(
+                            out_channel,
+                            document=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=_cap,
+                            progress=_ul_progress,
+                        )
 
                 sent = await upload_with_floodwait(_ul_coro, job_id=job_id, status_msg=None)
                 if not sent:
@@ -514,8 +535,8 @@ class JobPipeline:
 
                 await self._send_state(job_id, STATE_UPLOADING)
                 logger.info(
-                    "[pipeline] job=%s UPLOADING  type=document  size=%s",
-                    job_id, humanbytes(actual_size),
+                    "[pipeline] job=%s UPLOADING  type=%s  size=%s",
+                    job_id, upload_as, humanbytes(actual_size),
                 )
 
                 last_prog_edit[0] = 0.0
@@ -533,14 +554,36 @@ class JobPipeline:
                     )
 
                 async def _ul_coro():
-                    return await self._bot.send_document(
-                        out_channel,
-                        document=file_path,
-                        file_name=final_name,
-                        thumb=thumb_path,
-                        caption=caption,
-                        progress=_ul_progress,
-                    )
+                    if upload_as == "video":
+                        return await self._bot.send_video(
+                            out_channel,
+                            video=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=caption,
+                            duration=duration,
+                            supports_streaming=True,
+                            progress=_ul_progress,
+                        )
+                    elif upload_as == "audio":
+                        return await self._bot.send_audio(
+                            out_channel,
+                            audio=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=caption,
+                            duration=duration,
+                            progress=_ul_progress,
+                        )
+                    else:   # "document" — default, safe, no re-encode
+                        return await self._bot.send_document(
+                            out_channel,
+                            document=file_path,
+                            file_name=final_name,
+                            thumb=thumb_path,
+                            caption=caption,
+                            progress=_ul_progress,
+                        )
 
                 sent = await upload_with_floodwait(_ul_coro, job_id=job_id, status_msg=None)
                 if not sent:

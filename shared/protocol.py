@@ -137,6 +137,7 @@ def make_task(
     metadata_version:  int = 1,  # default to 1 — version 0 caused metadata to be skipped
     thumbnail_url:     str | None = None,
     dump_enabled:      bool = False,
+    upload_as:         str = "document",   # NEW — "document" | "video" | "audio"
 ) -> str:
     """Build a plain-text TASK proto string sent to the Worker Control Group.
     The worker fetches the source file itself via get_messages(source_chat_id,
@@ -156,6 +157,7 @@ def make_task(
         "metadata_version":   metadata_version,
         "thumbnail_url":      thumbnail_url,
         "dump_enabled":       dump_enabled,
+        "upload_as":          upload_as,          # NEW
     })
 
 
