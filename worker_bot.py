@@ -469,17 +469,83 @@ def _bootstrap_mkvtoolnix() -> None:
                 return member
         return None
 
+    def _decompress_data_tar(data_tar_raw: bytes, member_name: str) -> bytes | None:
+        """
+        Decompress the data.tar.* payload from a .deb ar archive.
+        Handles gz, bz2, xz natively via tarfile, and zstd via subprocess
+        (needed on Python < 3.12 where tarfile has no zstd support).
+        Returns raw tar bytes ready for tarfile.open(fileobj=..., mode='r:').
+        """
+        # zstd: Python 3.10's tarfile can't handle it; decompress with the
+        # system zstd binary first, then hand the plain tar to tarfile.
+        if member_name.endswith(".zst"):
+            try:
+                result = subprocess.run(
+                    ["zstd", "-d", "--stdout"],
+                    input=data_tar_raw,
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    return result.stdout
+                print(
+                    f"[bootstrap] zstd decompress failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    flush=True,
+                )
+                return None
+            except FileNotFoundError:
+                # zstd binary not available — try python-zstandard if installed
+                try:
+                    import zstandard as zstd  # type: ignore
+                    dctx = zstd.ZstdDecompressor()
+                    return dctx.decompress(data_tar_raw, max_output_size=256 * 1024 * 1024)
+                except ImportError:
+                    print(
+                        "[bootstrap] zstd decompressor not available "
+                        "(no zstd binary and no python-zstandard); cannot unpack .deb",
+                        flush=True,
+                    )
+                    return None
+        # All other compressions (gz, bz2, xz, uncompressed) are handled
+        # transparently by tarfile.open() with mode='r:*'.
+        return data_tar_raw
+
     def _extract_paths(deb_bytes: bytes, path_filter) -> dict[str, bytes]:
         """
         Extract files from a .deb whose normalised path satisfies path_filter(path).
+        Handles both legacy (gz/bz2/xz) and modern (zstd) data.tar compression.
         Returns {normalised_path: file_bytes}.
         """
-        data_tar = _ar_member(deb_bytes, "data.tar")
-        if data_tar is None:
+        # Find the data.tar.* member — could be data.tar, data.tar.gz,
+        # data.tar.bz2, data.tar.xz, or data.tar.zst (modern Ubuntu debs).
+        data_tar_raw = _ar_member(deb_bytes, "data.tar")
+        if data_tar_raw is None:
+            print("[bootstrap] .deb has no data.tar.* member", flush=True)
             return {}
+
+        # Reconstruct the full member name to know the compression type.
+        # Re-scan the ar archive for the matching member name.
+        data_tar_name = "data.tar"
+        pos = 8
+        while pos + 60 <= len(deb_bytes):
+            name = deb_bytes[pos:pos+16].rstrip(b" \x00").decode(errors="replace").rstrip("/")
+            size = int(deb_bytes[pos+48:pos+58].rstrip(b" \x00") or b"0")
+            pos += 60
+            if name.startswith("data.tar"):
+                data_tar_name = name
+                break
+            pos += size + (size & 1)
+
+        data_tar_bytes = _decompress_data_tar(data_tar_raw, data_tar_name)
+        if data_tar_bytes is None:
+            return {}
+
         result: dict[str, bytes] = {}
         try:
-            with tarfile.open(fileobj=io.BytesIO(data_tar)) as tar:
+            # mode='r:' for uncompressed tar (we already decompressed zstd above);
+            # 'r:*' auto-detects gz/bz2/xz for the remaining cases.
+            mode = "r:" if data_tar_name.endswith(".zst") else "r:*"
+            with tarfile.open(fileobj=io.BytesIO(data_tar_bytes), mode=mode) as tar:
                 for member in tar.getmembers():
                     norm = member.name.lstrip("./")
                     if member.isfile() and path_filter(norm):
