@@ -504,22 +504,38 @@ def _bootstrap_mkvtoolnix() -> None:
     CODENAME_PRIMARY  = "jammy"   # Heroku-22 == Ubuntu 22.04
     CODENAME_FALLBACK = "noble"   # Ubuntu 24.04
 
-    UBUNTU_BASE = "https://archive.ubuntu.com/ubuntu"
+    # Multiple Ubuntu archive mirrors — tried in order when fetching Packages.gz.
+    # archive.ubuntu.com is the primary; ports.ubuntu.com and us.archive.ubuntu.com
+    # are fallbacks in case Heroku egress to the primary is blocked or timing out.
+    UBUNTU_MIRRORS = [
+        "https://archive.ubuntu.com/ubuntu",
+        "https://us.archive.ubuntu.com/ubuntu",
+        "https://ports.ubuntu.com/ubuntu-ports",
+    ]
 
     def _ubuntu_packages_index(codename: str, component: str = "universe") -> str | None:
-        """Fetch binary-amd64 Packages.gz from the Ubuntu archive."""
-        url = (
-            f"{UBUNTU_BASE}/dists/{codename}/{component}"
-            f"/binary-amd64/Packages.gz"
-        )
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "worker-bot/1.0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                return gzip.decompress(r.read()).decode(errors="replace")
-        except Exception as exc:
-            print(f"[bootstrap] Ubuntu Packages.gz [{codename}/{component}] failed: {exc}",
-                  flush=True)
-            return None
+        """Fetch binary-amd64 Packages.gz from the Ubuntu archive, trying multiple mirrors."""
+        for mirror in UBUNTU_MIRRORS:
+            url = f"{mirror}/dists/{codename}/{component}/binary-amd64/Packages.gz"
+            print(f"[bootstrap] Ubuntu index: fetching {url}", flush=True)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "worker-bot/1.0"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    status = getattr(r, "status", "?")
+                    data = r.read()
+                    print(
+                        f"[bootstrap] Ubuntu index: HTTP {status}  {len(data):,} bytes "
+                        f"from {mirror}",
+                        flush=True,
+                    )
+                    return gzip.decompress(data).decode(errors="replace")
+            except Exception as exc:
+                print(
+                    f"[bootstrap] Ubuntu index [{codename}/{component}] "
+                    f"failed ({mirror}): {exc}",
+                    flush=True,
+                )
+        return None
 
     # Fetch the MKVToolNix PPA index (for mkvtoolnix binary)
     ppa_index = _packages_index(CODENAME_PRIMARY)
@@ -536,10 +552,13 @@ def _bootstrap_mkvtoolnix() -> None:
         # Also try 'main' component as a last resort (older Ubuntu kept them there)
         if not ubuntu_index:
             ubuntu_index = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
-        if not ubuntu_index:
-            print("[bootstrap] Could not fetch Ubuntu archive Packages.gz — giving up.",
-                  flush=True)
-        else:
+        if ubuntu_index is None:
+            print(
+                "[bootstrap] Could not fetch Ubuntu archive Packages.gz from any mirror "
+                "— libebml/libmatroska will rely on PPA index only.",
+                flush=True,
+            )
+        if True:  # always attempt download even if ubuntu_index failed
             # Three packages, two sources:
             #   mkvtoolnix   ← MKVToolNix PPA
             #   libebml5     ← Ubuntu archive/universe  (try t64 variant too)
@@ -569,7 +588,14 @@ def _bootstrap_mkvtoolnix() -> None:
             # then fall back to the other index if the primary has a stale/404 URL.
             # This handles the case where PPA Packages.gz lists libebml5 but
             # the actual .deb URL returns 404 (file removed from PPA mirror).
-            all_indexes = [ppa_index, ubuntu_index]
+            # ubuntu_index may be None if all archive mirrors failed; filter it out.
+            all_indexes = [idx for idx in [ppa_index, ubuntu_index] if idx is not None]
+            print(
+                f"[bootstrap] Index sources available: "
+                f"ppa={'yes' if ppa_index else 'no'}  "
+                f"ubuntu={'yes' if ubuntu_index else 'NO — archive mirrors unreachable'}",
+                flush=True,
+            )
 
             all_ok = True
             for slot_name, path_filter, primary_index, candidates in PKGS:
@@ -577,7 +603,12 @@ def _bootstrap_mkvtoolnix() -> None:
                 # checking the primary index first, then the other index.
                 to_try: list[tuple[str, str, str]] = []
                 seen_urls: set[str] = set()
-                for idx in ([primary_index] + [i for i in all_indexes if i is not primary_index]):
+                # primary_index may be None (e.g. ubuntu_index failed); skip it if so.
+                ordered = (
+                    ([primary_index] if primary_index is not None else [])
+                    + [i for i in all_indexes if i is not primary_index]
+                )
+                for idx in ordered:
                     for candidate in candidates:
                         info = _find_deb_url(idx, candidate)
                         if info:
