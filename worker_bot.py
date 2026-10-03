@@ -657,15 +657,16 @@ def _bootstrap_mkvtoolnix() -> None:
                 flush=True,
             )
         if True:  # always attempt download even if ubuntu_index failed
-            # Five packages, two sources:
+            # Six packages, two sources:
             #   mkvtoolnix          ← MKVToolNix PPA
             #   libebml5            ← Ubuntu archive/universe  (try t64 variant too)
             #   libmatroska7        ← Ubuntu archive/universe  (try t64 variant too)
             #   libboost-filesystem ← Ubuntu archive/main  (mkvpropedit runtime dep)
             #   libboost-system     ← Ubuntu archive/main  (mkvpropedit runtime dep)
-            # NOTE: mkvpropedit links against libboost_filesystem.so.1.74.0 and
-            # libboost_system.so.1.74.0.  Without these the binary exits 127
-            # ("cannot open shared object file") and the whole bootstrap fails.
+            #   libfmt8             ← Ubuntu archive/universe  (mkvpropedit runtime dep)
+            # NOTE: mkvpropedit links against libboost_filesystem.so.1.74.0,
+            # libboost_system.so.1.74.0, and libfmt.so.8.  Without these the binary
+            # exits 127 ("cannot open shared object file") and bootstrap fails.
             PKGS = [
                 (
                     "mkvtoolnix",
@@ -704,6 +705,15 @@ def _bootstrap_mkvtoolnix() -> None:
                     ubuntu_main_index or ubuntu_index,
                     ["libboost-system1.74.0", "libboost-system1.74-dev",
                      "libboost-system1.83.0", "libboost-system1.83-dev"],
+                ),
+                (
+                    "libfmt",
+                    lambda p: (
+                        p.startswith("usr/lib/x86_64-linux-gnu/libfmt")
+                        and ".so" in p
+                    ),
+                    ubuntu_index,
+                    ["libfmt8", "libfmt9", "libfmt-dev"],
                 ),
             ]
 
