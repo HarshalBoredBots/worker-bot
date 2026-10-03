@@ -421,9 +421,9 @@ def _bootstrap_mkvtoolnix() -> None:
     # the CURRENT release, so we need the exact current version number.
     # If both discovery methods fail, we work backwards from recent to old.
     _STATIC_VERSIONS = [
-        "96.0", "95.0", "94.0", "93.0", "92.0", "91.0", "90.0",
-        "89.0", "88.0", "87.0", "86.0", "85.0", "84.0", "83.0", "82.0",
-    ]
+    "102.0", "101.0", "100.0", "99.0", "98.0", "97.0", "96.0", "95.0",
+    "94.0", "93.0", "92.0", "91.0", "90.0", "89.0", "88.0", "87.0",
+]
     _BASE = "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-{v}.tar.xz"
 
     github_ver   = _github_latest_version()
