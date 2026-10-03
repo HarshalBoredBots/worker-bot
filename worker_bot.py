@@ -319,12 +319,11 @@ _bootstrap_ffmpeg()
 #     The GitHub API is a more reliable way to find the current version.
 #
 # The fix:
-#   1. Query GitHub API (Matroska-Org/mkvtoolnix releases/latest) to get
-#      the current version tag, then build the exact download URL.
-#   2. Also scrape the mkvtoolnix.download linux index as before (belt
-#      and suspenders).
-#   3. Extend the static fallback list to cover a wider range of recent
-#      versions so the worker can still boot if both discovery methods fail.
+#   1. Query GitLab API (mbunkus/mkvtoolnix) for the latest release tag —
+#      MKVToolNix is on GitLab, not GitHub; the GitHub API always 404s.
+#   2. Also scrape mkvtoolnix.download for tarball links (belt & suspenders).
+#   3. Wide static fallback list (130.0 → 91.0) so the worker can still boot
+#      if both live discovery methods fail.
 #   4. Same HTTP validation improvements as _bootstrap_ffmpeg.
 #   5. Run "mkvpropedit --version" to verify the binary before marking it
 #      as ready.
@@ -371,62 +370,78 @@ def _bootstrap_mkvtoolnix() -> None:
 
     # ── Version discovery ────────────────────────────────────────────────────
 
-    def _github_latest_version() -> str | None:
+    def _gitlab_latest_version() -> str | None:
         """
-        Ask GitHub API for the latest mkvtoolnix release tag.
-        Tags look like 'release-91.0' or 'v91.0'; we extract the numeric part.
+        Ask GitLab API for the latest mkvtoolnix release tag.
+        MKVToolNix is developed on GitLab (gitlab.com/mbunkus/mkvtoolnix),
+        NOT on GitHub — the GitHub API always returns 404 for it.
+        Tags look like 'release-91.0'; we extract the numeric part.
         """
         try:
             req = urllib.request.Request(
-                "https://api.github.com/repos/Matroska-Org/mkvtoolnix/releases/latest",
-                headers={
-                    "Accept":     "application/vnd.github+json",
-                    "User-Agent": "worker-bot/1.0",
-                },
+                "https://gitlab.com/api/v4/projects/mbunkus%2Fmkvtoolnix"
+                "/releases?per_page=1",
+                headers={"User-Agent": "worker-bot/1.0"},
             )
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode())
-            tag = data.get("tag_name", "")
+            if not data:
+                return None
+            tag = data[0].get("tag_name", "")
             m = _re.search(r"(\d+\.\d+(?:\.\d+)?)", tag)
             if m:
                 ver = m.group(1)
-                print(f"[bootstrap] GitHub API: latest mkvtoolnix = {ver}", flush=True)
+                print(f"[bootstrap] GitLab API: latest mkvtoolnix = {ver}", flush=True)
                 return ver
         except Exception as exc:
-            print(f"[bootstrap] GitHub API lookup failed: {exc}", flush=True)
+            print(f"[bootstrap] GitLab API lookup failed: {exc}", flush=True)
         return None
 
     def _discover_index_versions() -> list[str]:
-        """Scrape mkvtoolnix.download/linux/ for tarball filenames."""
-        try:
-            with urllib.request.urlopen(
-                "https://mkvtoolnix.download/linux/", timeout=10
-            ) as r:
-                html = r.read().decode(errors="replace")
-            found = _re.findall(r"mkvtoolnix-64bit-([\d.]+)\.tar\.xz", html)
+        """
+        Scrape mkvtoolnix.download for tarball filenames.
+        The /linux/ directory index is not publicly listable; try the
+        root and /builds/ pages which may link to current tarballs.
+        """
+        for url in [
+            "https://mkvtoolnix.download/builds/",
+            "https://mkvtoolnix.download/",
+        ]:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as r:
+                    html = r.read().decode(errors="replace")
+                found = _re.findall(r"mkvtoolnix-64bit-([\d.]+)\.tar\.xz", html)
+                if found:
+                    def _ver_key(v: str):
+                        try:
+                            return tuple(int(x) for x in v.split("."))
+                        except Exception:
+                            return (0,)
+                    vers = sorted(set(found), key=_ver_key, reverse=True)
+                    print(
+                        f"[bootstrap] index scrape found versions: {vers[:5]}",
+                        flush=True,
+                    )
+                    return vers
+            except Exception as exc:
+                print(f"[bootstrap] index scrape {url} failed: {exc}", flush=True)
+        return []
 
-            def _ver_key(v: str):
-                try:
-                    return tuple(int(x) for x in v.split("."))
-                except Exception:
-                    return (0,)
-
-            return sorted(set(found), key=_ver_key, reverse=True)
-        except Exception as exc:
-            print(f"[bootstrap] mkvtoolnix index scrape failed: {exc}", flush=True)
-            return []
-
-    # Assemble candidate URL list: GitHub API → index scrape → wide static list
-    # The static list is deliberately wide — mkvtoolnix.download keeps only
-    # the CURRENT release, so we need the exact current version number.
-    # If both discovery methods fail, we work backwards from recent to old.
+    # Assemble candidate URL list: GitLab API → index scrape → wide static list.
+    # mkvtoolnix.download keeps only the CURRENT release tarball, so dynamic
+    # discovery is essential.  The static list is a last-resort fallback that
+    # covers ~3 years of monthly releases in descending order; update the top
+    # entries whenever the GitLab API also stops working.
     _STATIC_VERSIONS = [
-    "102.0", "101.0", "100.0", "99.0", "98.0", "97.0", "96.0", "95.0",
-    "94.0", "93.0", "92.0", "91.0", "90.0", "89.0", "88.0", "87.0",
-]
+        "130.0", "129.0", "128.0", "127.0", "126.0", "125.0", "124.0", "123.0",
+        "122.0", "121.0", "120.0", "119.0", "118.0", "117.0", "116.0", "115.0",
+        "114.0", "113.0", "112.0", "111.0", "110.0", "109.0", "108.0", "107.0",
+        "106.0", "105.0", "104.0", "103.0", "102.0", "101.0", "100.0", "99.0",
+        "98.0", "97.0", "96.0", "95.0", "94.0", "93.0", "92.0", "91.0",
+    ]
     _BASE = "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-{v}.tar.xz"
 
-    github_ver   = _github_latest_version()
+    gitlab_ver   = _gitlab_latest_version()
     index_vers   = _discover_index_versions()
 
     _seen: set[str] = set()
@@ -438,8 +453,8 @@ def _bootstrap_mkvtoolnix() -> None:
             _seen.add(url)
             URLS.append(url)
 
-    if github_ver:
-        _add(github_ver)
+    if gitlab_ver:
+        _add(gitlab_ver)
     for v in index_vers:
         _add(v)
     for v in _STATIC_VERSIONS:
