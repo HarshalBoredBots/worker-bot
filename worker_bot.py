@@ -565,30 +565,52 @@ def _bootstrap_mkvtoolnix() -> None:
                 ),
             ]
 
-            all_ok = True
-            for slot_name, path_filter, index_to_search, candidates in PKGS:
-                pkg_name = None
-                pkg_info = None
-                for candidate in candidates:
-                    pkg_info = _find_deb_url(index_to_search, candidate)
-                    if pkg_info:
-                        pkg_name = candidate
-                        break
+            # Build a combined search list per slot: primary index first,
+            # then fall back to the other index if the primary has a stale/404 URL.
+            # This handles the case where PPA Packages.gz lists libebml5 but
+            # the actual .deb URL returns 404 (file removed from PPA mirror).
+            all_indexes = [ppa_index, ubuntu_index]
 
-                if not pkg_info:
+            all_ok = True
+            for slot_name, path_filter, primary_index, candidates in PKGS:
+                # Build a de-duplicated ordered list of (pkg_name, ver, url) to try,
+                # checking the primary index first, then the other index.
+                to_try: list[tuple[str, str, str]] = []
+                seen_urls: set[str] = set()
+                for idx in ([primary_index] + [i for i in all_indexes if i is not primary_index]):
+                    for candidate in candidates:
+                        info = _find_deb_url(idx, candidate)
+                        if info:
+                            ver, url = info
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                to_try.append((candidate, ver, url))
+
+                if not to_try:
                     print(
-                        f"[bootstrap] {slot_name} not found "
+                        f"[bootstrap] {slot_name} not found in any index "
                         f"(tried: {candidates})",
                         flush=True,
                     )
                     all_ok = False
                     break
 
-                ver, url = pkg_info
-                print(f"[bootstrap] {pkg_name} {ver}: {url}", flush=True)
+                deb = None
+                pkg_name = None
+                for candidate, ver, url in to_try:
+                    print(f"[bootstrap] {slot_name}: trying {candidate} {ver} from {url}", flush=True)
+                    deb = _download(url)
+                    if deb:
+                        pkg_name = candidate
+                        break
+                    print(f"[bootstrap] {slot_name}: {url} failed, trying next source", flush=True)
 
-                deb = _download(url)
                 if not deb:
+                    print(
+                        f"[bootstrap] {slot_name}: all download attempts failed "
+                        f"(tried {len(to_try)} URL(s))",
+                        flush=True,
+                    )
                     all_ok = False
                     break
 
