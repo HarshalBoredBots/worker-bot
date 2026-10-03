@@ -419,9 +419,14 @@ def _bootstrap_mkvtoolnix() -> None:
             print(f"[bootstrap] Packages.gz [{codename}] failed: {exc}", flush=True)
             return None
 
-    def _find_deb_url(index_text: str, package_name: str) -> tuple[str, str] | None:
+    def _find_deb_url(
+        index_text: str, package_name: str, base_url: str = BASE
+    ) -> tuple[str, str] | None:
         """
-        Parse an apt Packages text blob and return (version, url) for package_name.
+        Parse an apt Packages text blob and return (version, absolute_url) for
+        package_name.  base_url must match the server that served the index so
+        that the relative Filename: path is resolved correctly.  Defaults to the
+        MKVToolNix PPA base for backward-compatibility with ppa_index callers.
         """
         for stanza in index_text.split("\n\n"):
             if not _re.search(
@@ -433,7 +438,7 @@ def _bootstrap_mkvtoolnix() -> None:
             if m_f:
                 return (
                     m_v.group(1).strip() if m_v else "unknown",
-                    f"{BASE}/{m_f.group(1).strip()}",
+                    f"{base_url}/{m_f.group(1).strip()}",
                 )
         return None
 
@@ -513,8 +518,14 @@ def _bootstrap_mkvtoolnix() -> None:
         "https://ports.ubuntu.com/ubuntu-ports",
     ]
 
-    def _ubuntu_packages_index(codename: str, component: str = "universe") -> str | None:
-        """Fetch binary-amd64 Packages.gz from the Ubuntu archive, trying multiple mirrors."""
+    def _ubuntu_packages_index(
+        codename: str, component: str = "universe"
+    ) -> tuple[str, str] | None:
+        """
+        Fetch binary-amd64 Packages.gz from the Ubuntu archive, trying multiple mirrors.
+        Returns (index_text, mirror_base_url) so callers can construct correct .deb URLs,
+        or None if all mirrors fail.
+        """
         for mirror in UBUNTU_MIRRORS:
             url = f"{mirror}/dists/{codename}/{component}/binary-amd64/Packages.gz"
             print(f"[bootstrap] Ubuntu index: fetching {url}", flush=True)
@@ -528,7 +539,7 @@ def _bootstrap_mkvtoolnix() -> None:
                         f"from {mirror}",
                         flush=True,
                     )
-                    return gzip.decompress(data).decode(errors="replace")
+                    return gzip.decompress(data).decode(errors="replace"), mirror
             except Exception as exc:
                 print(
                     f"[bootstrap] Ubuntu index [{codename}/{component}] "
@@ -546,12 +557,19 @@ def _bootstrap_mkvtoolnix() -> None:
     else:
         # Fetch the Ubuntu archive index (for libebml5 + libmatroska7).
         # These live in 'universe'; try jammy first, noble as fallback.
-        ubuntu_index = _ubuntu_packages_index(CODENAME_PRIMARY, "universe")
+        ubuntu_index = ubuntu_base = None
+        _r = _ubuntu_packages_index(CODENAME_PRIMARY, "universe")
+        if _r:
+            ubuntu_index, ubuntu_base = _r
         if not ubuntu_index:
-            ubuntu_index = _ubuntu_packages_index(CODENAME_FALLBACK, "universe")
+            _r = _ubuntu_packages_index(CODENAME_FALLBACK, "universe")
+            if _r:
+                ubuntu_index, ubuntu_base = _r
         # Also try 'main' component as a last resort (older Ubuntu kept them there)
         if not ubuntu_index:
-            ubuntu_index = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
+            _r = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
+            if _r:
+                ubuntu_index, ubuntu_base = _r
         if ubuntu_index is None:
             print(
                 "[bootstrap] Could not fetch Ubuntu archive Packages.gz from any mirror "
@@ -584,33 +602,36 @@ def _bootstrap_mkvtoolnix() -> None:
                 ),
             ]
 
-            # Build a combined search list per slot: primary index first,
-            # then fall back to the other index if the primary has a stale/404 URL.
-            # This handles the case where PPA Packages.gz lists libebml5 but
-            # the actual .deb URL returns 404 (file removed from PPA mirror).
+            # Build a combined (index, base_url) search list.
+            # base_url must match the server that served the index so _find_deb_url
+            # builds correct absolute .deb URLs (PPA vs Ubuntu archive differ).
             # ubuntu_index may be None if all archive mirrors failed; filter it out.
-            all_indexes = [idx for idx in [ppa_index, ubuntu_index] if idx is not None]
+            all_index_sources: list[tuple[str, str]] = [
+                s for s in [(ppa_index, BASE), (ubuntu_index, ubuntu_base)]
+                if s[0] is not None
+            ]
             print(
                 f"[bootstrap] Index sources available: "
                 f"ppa={'yes' if ppa_index else 'no'}  "
-                f"ubuntu={'yes' if ubuntu_index else 'NO — archive mirrors unreachable'}",
+                f"ubuntu={'yes (base=' + ubuntu_base + ')' if ubuntu_index else 'NO — archive mirrors unreachable'}",
                 flush=True,
             )
 
             all_ok = True
             for slot_name, path_filter, primary_index, candidates in PKGS:
                 # Build a de-duplicated ordered list of (pkg_name, ver, url) to try,
-                # checking the primary index first, then the other index.
+                # checking the primary index first, then the other index sources.
+                # Each source carries its own base_url so URLs are built correctly.
                 to_try: list[tuple[str, str, str]] = []
                 seen_urls: set[str] = set()
-                # primary_index may be None (e.g. ubuntu_index failed); skip it if so.
-                ordered = (
-                    ([primary_index] if primary_index is not None else [])
-                    + [i for i in all_indexes if i is not primary_index]
-                )
-                for idx in ordered:
+                # primary_index may be None (e.g. ubuntu_index failed); find its base.
+                primary_base = BASE if primary_index is ppa_index else ubuntu_base
+                primary_pair = (primary_index, primary_base) if primary_index is not None else None
+                others = [s for s in all_index_sources if s[0] is not primary_index]
+                ordered_sources = ([primary_pair] if primary_pair else []) + others
+                for idx, idx_base in ordered_sources:
                     for candidate in candidates:
-                        info = _find_deb_url(idx, candidate)
+                        info = _find_deb_url(idx, candidate, base_url=idx_base)
                         if info:
                             ver, url = info
                             if url not in seen_urls:
