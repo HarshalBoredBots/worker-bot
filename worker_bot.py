@@ -336,50 +336,57 @@ _bootstrap_ffmpeg()
 
 def _bootstrap_mkvtoolnix() -> None:
     """
-    Download mkvpropedit from the official MKVToolNix Ubuntu apt repository.
+    Download mkvpropedit from the official MKVToolNix Ubuntu apt repository,
+    bundling the two PPA-only shared libraries it needs so the binary runs on
+    Heroku without any system-level package installation.
 
     ROOT CAUSE of previous failures
     ────────────────────────────────
-    • mkvtoolnix.download stopped hosting generic static Linux tarballs.
-      Every URL of the form mkvtoolnix-64bit-{v}.tar.xz returns 404 for ALL
-      versions — the URL format is permanently dead.
-    • The GitHub API was wrong (MKVToolNix is on GitLab, not GitHub).
-    • The GitLab API also returns 404 from Heroku IPs (likely because the
-      project uses tags only, not formal GitLab Releases, or GitLab blocks
-      unauthenticated API from cloud egress ranges).
+    • mkvtoolnix.download no longer hosts generic static Linux tarballs.
+      Every mkvtoolnix-64bit-{v}.tar.xz URL returns 404 permanently.
+    • The GitHub API is wrong (MKVToolNix is on GitLab, not GitHub) and the
+      GitLab API also returns 404 from Heroku IPs.
+    • The .deb download worked (mkvtoolnix 94.0 extracted successfully) but
+      the binary exited 127 because it is dynamically linked against
+      libmatroska and libebml — PPA-only libraries not present on the dyno.
+      Using the 'oracular' (Ubuntu 24.10) package on a Heroku-22 (Ubuntu 22.04)
+      dyno also risks ABI mismatches in libc/libstdc++.
 
-    New strategy — use the official apt repository
-    ────────────────────────────────────────────────
-    1. Fetch Packages.gz from mkvtoolnix.download/ubuntu for the closest
-       Ubuntu codename (Heroku-22 = jammy).  This gives the current .deb
-       Filename without any version hardcoding.
-    2. Download that .deb package.
-    3. Extract mkvpropedit from data.tar.* inside the .deb using pure Python
-       (simple ar-format parser + tarfile).  No system tools (ar, dpkg) needed.
-    4. Verify with "mkvpropedit --version".
-    5. NON-FATAL: worker starts without mkvpropedit and uses FFmpeg fallback,
-       which will fail for MKV files with broken attachment streams (exit 183).
+    New strategy
+    ─────────────
+    1. Fetch Packages.gz from mkvtoolnix.download/ubuntu for 'jammy'
+       (Ubuntu 22.04 — matches Heroku-22).  Parse stanzas for three packages:
+         mkvtoolnix   → provides  usr/bin/mkvpropedit
+         libebml5     → provides  usr/lib/x86_64-linux-gnu/libebml.so.5*
+         libmatroska7 → provides  usr/lib/x86_64-linux-gnu/libmatroska.so.7*
+    2. Download and extract each .deb with a pure-Python ar parser + tarfile.
+    3. Save the binary as  bin/mkvpropedit_bin
+       Save the .so files  into  bin/lib/
+    4. Write a tiny shell wrapper at  bin/mkvpropedit  that prepends bin/lib
+       to LD_LIBRARY_PATH and exec-s mkvpropedit_bin.  _find_binary() in
+       ffmpeg.py will pick up the wrapper transparently.
+    5. Verify: wrapper must exit 0 on  mkvpropedit --version.
+    6. NON-FATAL: worker starts without mkvpropedit on any failure.
     """
     import gzip
     import io
     import os
     import re as _re
-    import struct
     import subprocess
     import tarfile
-    import tempfile
-    import time
     import urllib.error
     import urllib.request
 
-    bin_dir          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
-    mkvpropedit_path = os.path.join(bin_dir, "mkvpropedit")
+    bin_dir     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+    lib_dir     = os.path.join(bin_dir, "lib")
+    wrapper     = os.path.join(bin_dir, "mkvpropedit")          # shell wrapper
+    real_bin    = os.path.join(bin_dir, "mkvpropedit_bin")      # actual ELF
 
     # ── Cache check ──────────────────────────────────────────────────────────
-    if os.path.isfile(mkvpropedit_path) and os.access(mkvpropedit_path, os.X_OK):
+    if os.path.isfile(wrapper) and os.access(wrapper, os.X_OK):
         try:
             r = subprocess.run(
-                [mkvpropedit_path, "--version"], capture_output=True, timeout=10
+                [wrapper, "--version"], capture_output=True, timeout=10
             )
             if r.returncode == 0:
                 ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
@@ -387,183 +394,211 @@ def _bootstrap_mkvtoolnix() -> None:
                 return
         except Exception:
             pass
-        try:
-            os.unlink(mkvpropedit_path)
-        except Exception:
-            pass
+        # Wrapper exists but broken — clean up and retry
+        for p in (wrapper, real_bin):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
     os.makedirs(bin_dir, exist_ok=True)
+    os.makedirs(lib_dir, exist_ok=True)
 
-    # ── Step 1: Find the .deb URL from the apt Packages index ────────────────
-    # Try codenames from newest to oldest; Heroku-22 runs Ubuntu 22.04 (jammy).
-    CODENAMES = ["oracular", "noble", "jammy", "focal"]
-    BASE      = "https://mkvtoolnix.download/ubuntu"
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _find_deb_url() -> str | None:
-        for codename in CODENAMES:
-            pkg_index_url = (
-                f"{BASE}/dists/{codename}/main/binary-amd64/Packages.gz"
-            )
-            try:
-                req = urllib.request.Request(
-                    pkg_index_url,
-                    headers={"User-Agent": "worker-bot/1.0"},
-                )
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    raw = r.read()
-                text = gzip.decompress(raw).decode(errors="replace")
-            except Exception as exc:
-                print(
-                    f"[bootstrap] Packages.gz [{codename}] failed: {exc}",
-                    flush=True,
-                )
+    BASE = "https://mkvtoolnix.download/ubuntu"
+
+    def _packages_index(codename: str) -> str | None:
+        """Download and decompress Packages.gz for a codename. Returns text or None."""
+        url = f"{BASE}/dists/{codename}/main/binary-amd64/Packages.gz"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "worker-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return gzip.decompress(r.read()).decode(errors="replace")
+        except Exception as exc:
+            print(f"[bootstrap] Packages.gz [{codename}] failed: {exc}", flush=True)
+            return None
+
+    def _find_deb_url(index_text: str, package_name: str) -> tuple[str, str] | None:
+        """
+        Parse an apt Packages text blob and return (version, url) for package_name.
+        """
+        for stanza in index_text.split("\n\n"):
+            if not _re.search(
+                rf"^Package: {_re.escape(package_name)}$", stanza, _re.MULTILINE
+            ):
                 continue
-
-            # Stanzas are separated by blank lines
-            for stanza in text.split("\n\n"):
-                if not _re.search(r"^Package: mkvtoolnix$", stanza, _re.MULTILINE):
-                    continue
-                m_file = _re.search(r"^Filename: (.+)$", stanza, _re.MULTILINE)
-                if not m_file:
-                    continue
-                rel_path = m_file.group(1).strip()
-                m_ver    = _re.search(r"^Version: (.+)$",  stanza, _re.MULTILINE)
-                ver_str  = m_ver.group(1).strip() if m_ver else "unknown"
-                url      = f"{BASE}/{rel_path}"
-                print(
-                    f"[bootstrap] apt index [{codename}]: "
-                    f"mkvtoolnix {ver_str} → {url}",
-                    flush=True,
+            m_f = _re.search(r"^Filename: (.+)$", stanza, _re.MULTILINE)
+            m_v = _re.search(r"^Version: (.+)$",  stanza, _re.MULTILINE)
+            if m_f:
+                return (
+                    m_v.group(1).strip() if m_v else "unknown",
+                    f"{BASE}/{m_f.group(1).strip()}",
                 )
-                return url
-
-            print(
-                f"[bootstrap] mkvtoolnix not found in Packages.gz [{codename}]",
-                flush=True,
-            )
         return None
 
-    # ── Step 2: Pure-Python .deb extraction ──────────────────────────────────
-
-    def _ar_extract(ar_bytes: bytes, name_prefix: str) -> bytes | None:
-        """
-        Extract the first member whose name starts with `name_prefix` from
-        an ar(1) archive.  The ar format is:
-          - 8-byte magic  "!<arch>\n"
-          - Per member: 60-byte fixed header + data (padded to even length)
-        """
-        MAGIC = b"!<arch>\n"
-        if not ar_bytes.startswith(MAGIC):
-            print("[bootstrap] .deb: bad ar magic", flush=True)
+    def _download(url: str) -> bytes | None:
+        """Download url → bytes, or None on failure."""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "worker-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = r.read()
+            print(f"[bootstrap] Downloaded {len(data):,} B from {url}", flush=True)
+            return data
+        except Exception as exc:
+            print(f"[bootstrap] Download failed {url}: {exc}", flush=True)
             return None
-        pos = len(MAGIC)
+
+    def _ar_member(ar_bytes: bytes, name_prefix: str) -> bytes | None:
+        """Extract first ar(1) member whose name starts with name_prefix."""
+        if not ar_bytes.startswith(b"!<arch>\n"):
+            return None
+        pos = 8
         while pos + 60 <= len(ar_bytes):
-            hdr      = ar_bytes[pos : pos + 60]
-            name     = hdr[0:16].rstrip(b" \x00").decode(errors="replace")
-            size_str = hdr[48:58].rstrip(b" \x00")
-            size     = int(size_str) if size_str.strip() else 0
-            pos     += 60
-            member   = ar_bytes[pos : pos + size]
-            pos     += size + (size & 1)   # pad to even
+            name = ar_bytes[pos:pos+16].rstrip(b" \x00").decode(errors="replace")
+            size = int(ar_bytes[pos+48:pos+58].rstrip(b" \x00") or b"0")
+            pos += 60
+            member = ar_bytes[pos:pos+size]
+            pos += size + (size & 1)
             if name.rstrip("/").startswith(name_prefix):
                 return member
         return None
 
-    def _extract_mkvpropedit(deb_bytes: bytes) -> bytes | None:
+    def _extract_paths(deb_bytes: bytes, path_filter) -> dict[str, bytes]:
         """
-        Pull /usr/bin/mkvpropedit out of a .deb package.
-        A .deb is an ar archive; we find data.tar.* and open it with tarfile.
+        Extract files from a .deb whose normalised path satisfies path_filter(path).
+        Returns {normalised_path: file_bytes}.
         """
-        data_tar = _ar_extract(deb_bytes, "data.tar")
+        data_tar = _ar_member(deb_bytes, "data.tar")
         if data_tar is None:
-            print("[bootstrap] data.tar not found in .deb ar archive", flush=True)
-            return None
-
+            return {}
+        result: dict[str, bytes] = {}
         try:
             with tarfile.open(fileobj=io.BytesIO(data_tar)) as tar:
                 for member in tar.getmembers():
-                    # normalise ./usr/bin/mkvpropedit → usr/bin/mkvpropedit
                     norm = member.name.lstrip("./")
-                    if norm == "usr/bin/mkvpropedit" and member.isfile():
+                    if member.isfile() and path_filter(norm):
                         fobj = tar.extractfile(member)
                         if fobj:
-                            data = fobj.read()
-                            print(
-                                f"[bootstrap] Extracted mkvpropedit "
-                                f"({len(data):,} bytes) from data.tar",
-                                flush=True,
-                            )
-                            return data
+                            result[norm] = fobj.read()
         except Exception as exc:
-            print(f"[bootstrap] tarfile extraction error: {exc}", flush=True)
-        return None
+            print(f"[bootstrap] tar extraction error: {exc}", flush=True)
+        return result
 
     # ── Main flow ─────────────────────────────────────────────────────────────
-    deb_url = _find_deb_url()
-    if not deb_url:
-        # Non-fatal — fall through to warning below
-        pass
+    # Use 'jammy' (Ubuntu 22.04) to match Heroku-22's libc/libstdc++ ABI.
+    # Fall back to 'noble' (24.04) if jammy is ever removed.
+    CODENAMES = ["jammy", "noble", "oracular", "focal"]
+
+    index_text = None
+    chosen_codename = None
+    for codename in CODENAMES:
+        index_text = _packages_index(codename)
+        if index_text:
+            chosen_codename = codename
+            break
+
+    if not index_text:
+        print("[bootstrap] Could not fetch any Packages.gz — giving up.", flush=True)
     else:
-        try:
-            print(f"[bootstrap] Downloading .deb: {deb_url}", flush=True)
-            req = urllib.request.Request(
-                deb_url, headers={"User-Agent": "worker-bot/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=120) as r:
-                deb_bytes = r.read()
+        # Packages to fetch: main binary + its two PPA-only shared libs
+        PKGS = {
+            "mkvtoolnix":   lambda p: p == "usr/bin/mkvpropedit",
+            "libebml5":     lambda p: (
+                p.startswith("usr/lib/x86_64-linux-gnu/libebml") and ".so" in p
+            ),
+            "libmatroska7": lambda p: (
+                p.startswith("usr/lib/x86_64-linux-gnu/libmatroska") and ".so" in p
+            ),
+        }
+
+        all_ok = True
+        for pkg_name, path_filter in PKGS.items():
+            info = _find_deb_url(index_text, pkg_name)
+            if not info:
+                print(
+                    f"[bootstrap] {pkg_name} not found in Packages.gz [{chosen_codename}]",
+                    flush=True,
+                )
+                all_ok = False
+                break
+            ver, url = info
             print(
-                f"[bootstrap] .deb downloaded ({len(deb_bytes):,} bytes)",
+                f"[bootstrap] {pkg_name} {ver} [{chosen_codename}]: {url}",
                 flush=True,
             )
-        except Exception as exc:
-            print(f"[bootstrap] .deb download failed: {exc}", flush=True)
-            deb_bytes = None
+            deb = _download(url)
+            if not deb:
+                all_ok = False
+                break
 
-        if deb_bytes:
-            binary = _extract_mkvpropedit(deb_bytes)
-            if binary:
-                try:
-                    with open(mkvpropedit_path, "wb") as f:
-                        f.write(binary)
-                    os.chmod(mkvpropedit_path, 0o755)
-
-                    r = subprocess.run(
-                        [mkvpropedit_path, "--version"],
-                        capture_output=True,
-                        timeout=10,
-                    )
-                    if r.returncode == 0:
-                        ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
-                        print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
-                        return  # ← success
-                    else:
-                        print(
-                            f"[bootstrap] mkvpropedit verification failed "
-                            f"(exit {r.returncode})",
-                            flush=True,
-                        )
-                        try:
-                            os.unlink(mkvpropedit_path)
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    print(f"[bootstrap] write/verify error: {exc}", flush=True)
-            else:
+            extracted = _extract_paths(deb, path_filter)
+            if not extracted:
                 print(
-                    "[bootstrap] mkvpropedit binary not found inside .deb",
+                    f"[bootstrap] No matching files in {pkg_name} .deb",
+                    flush=True,
+                )
+                all_ok = False
+                break
+
+            for norm_path, data in extracted.items():
+                fname = os.path.basename(norm_path)
+                if pkg_name == "mkvtoolnix":
+                    dest = real_bin
+                else:
+                    dest = os.path.join(lib_dir, fname)
+                with open(dest, "wb") as f:
+                    f.write(data)
+                os.chmod(dest, 0o755)
+                print(
+                    f"[bootstrap] Wrote {dest} ({len(data):,} B)",
                     flush=True,
                 )
 
-    # Non-fatal: worker starts and uses FFmpeg fallback for metadata embed.
-    # FFmpeg will fail with exit 183 on MKV files that have broken attachment
-    # streams — this is a known limitation when mkvpropedit is unavailable.
+        if all_ok and os.path.isfile(real_bin):
+            # Write the shell wrapper that injects LD_LIBRARY_PATH
+            wrapper_src = (
+                "#!/bin/sh\n"
+                f'export LD_LIBRARY_PATH="{lib_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"\n'
+                f'exec "{real_bin}" "$@"\n'
+            )
+            with open(wrapper, "w") as f:
+                f.write(wrapper_src)
+            os.chmod(wrapper, 0o755)
+            print(f"[bootstrap] Wrapper written: {wrapper}", flush=True)
+
+            # Verify
+            try:
+                r = subprocess.run(
+                    [wrapper, "--version"], capture_output=True, timeout=10
+                )
+                if r.returncode == 0:
+                    ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
+                    print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
+                    return   # ← success
+                else:
+                    stderr = r.stderr.decode(errors="replace").strip()
+                    print(
+                        f"[bootstrap] mkvpropedit verification failed "
+                        f"(exit {r.returncode}): {stderr[:300]}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[bootstrap] mkvpropedit verification error: {exc}", flush=True)
+
+            # Clean up broken files
+            for p in (wrapper, real_bin):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
     print(
         "[bootstrap] WARNING: mkvpropedit could not be installed.\n"
         "  Metadata embed for MKV files will use the FFmpeg fallback,\n"
         "  which may fail on files with broken attachment streams (exit 183).\n"
-        "  Fix: verify that mkvtoolnix.download/ubuntu is reachable from Heroku\n"
-        "  and that the Packages.gz index lists mkvtoolnix for one of:\n"
-        f"  {CODENAMES}",
+        "  Check that mkvtoolnix.download/ubuntu is reachable from Heroku\n"
+        "  and that Packages.gz lists mkvtoolnix + libebml5 + libmatroska7.",
         flush=True,
     )
 
