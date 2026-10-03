@@ -335,9 +335,36 @@ _bootstrap_ffmpeg()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bootstrap_mkvtoolnix() -> None:
-    import json
+    """
+    Download mkvpropedit from the official MKVToolNix Ubuntu apt repository.
+
+    ROOT CAUSE of previous failures
+    ────────────────────────────────
+    • mkvtoolnix.download stopped hosting generic static Linux tarballs.
+      Every URL of the form mkvtoolnix-64bit-{v}.tar.xz returns 404 for ALL
+      versions — the URL format is permanently dead.
+    • The GitHub API was wrong (MKVToolNix is on GitLab, not GitHub).
+    • The GitLab API also returns 404 from Heroku IPs (likely because the
+      project uses tags only, not formal GitLab Releases, or GitLab blocks
+      unauthenticated API from cloud egress ranges).
+
+    New strategy — use the official apt repository
+    ────────────────────────────────────────────────
+    1. Fetch Packages.gz from mkvtoolnix.download/ubuntu for the closest
+       Ubuntu codename (Heroku-22 = jammy).  This gives the current .deb
+       Filename without any version hardcoding.
+    2. Download that .deb package.
+    3. Extract mkvpropedit from data.tar.* inside the .deb using pure Python
+       (simple ar-format parser + tarfile).  No system tools (ar, dpkg) needed.
+    4. Verify with "mkvpropedit --version".
+    5. NON-FATAL: worker starts without mkvpropedit and uses FFmpeg fallback,
+       which will fail for MKV files with broken attachment streams (exit 183).
+    """
+    import gzip
+    import io
     import os
     import re as _re
+    import struct
     import subprocess
     import tarfile
     import tempfile
@@ -360,7 +387,6 @@ def _bootstrap_mkvtoolnix() -> None:
                 return
         except Exception:
             pass
-        # Binary exists but didn't run — remove and re-download
         try:
             os.unlink(mkvpropedit_path)
         except Exception:
@@ -368,224 +394,179 @@ def _bootstrap_mkvtoolnix() -> None:
 
     os.makedirs(bin_dir, exist_ok=True)
 
-    # ── Version discovery ────────────────────────────────────────────────────
+    # ── Step 1: Find the .deb URL from the apt Packages index ────────────────
+    # Try codenames from newest to oldest; Heroku-22 runs Ubuntu 22.04 (jammy).
+    CODENAMES = ["oracular", "noble", "jammy", "focal"]
+    BASE      = "https://mkvtoolnix.download/ubuntu"
 
-    def _gitlab_latest_version() -> str | None:
-        """
-        Ask GitLab API for the latest mkvtoolnix release tag.
-        MKVToolNix is developed on GitLab (gitlab.com/mbunkus/mkvtoolnix),
-        NOT on GitHub — the GitHub API always returns 404 for it.
-        Tags look like 'release-91.0'; we extract the numeric part.
-        """
-        try:
-            req = urllib.request.Request(
-                "https://gitlab.com/api/v4/projects/mbunkus%2Fmkvtoolnix"
-                "/releases?per_page=1",
-                headers={"User-Agent": "worker-bot/1.0"},
+    def _find_deb_url() -> str | None:
+        for codename in CODENAMES:
+            pkg_index_url = (
+                f"{BASE}/dists/{codename}/main/binary-amd64/Packages.gz"
             )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode())
-            if not data:
-                return None
-            tag = data[0].get("tag_name", "")
-            m = _re.search(r"(\d+\.\d+(?:\.\d+)?)", tag)
-            if m:
-                ver = m.group(1)
-                print(f"[bootstrap] GitLab API: latest mkvtoolnix = {ver}", flush=True)
-                return ver
-        except Exception as exc:
-            print(f"[bootstrap] GitLab API lookup failed: {exc}", flush=True)
+            try:
+                req = urllib.request.Request(
+                    pkg_index_url,
+                    headers={"User-Agent": "worker-bot/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    raw = r.read()
+                text = gzip.decompress(raw).decode(errors="replace")
+            except Exception as exc:
+                print(
+                    f"[bootstrap] Packages.gz [{codename}] failed: {exc}",
+                    flush=True,
+                )
+                continue
+
+            # Stanzas are separated by blank lines
+            for stanza in text.split("\n\n"):
+                if not _re.search(r"^Package: mkvtoolnix$", stanza, _re.MULTILINE):
+                    continue
+                m_file = _re.search(r"^Filename: (.+)$", stanza, _re.MULTILINE)
+                if not m_file:
+                    continue
+                rel_path = m_file.group(1).strip()
+                m_ver    = _re.search(r"^Version: (.+)$",  stanza, _re.MULTILINE)
+                ver_str  = m_ver.group(1).strip() if m_ver else "unknown"
+                url      = f"{BASE}/{rel_path}"
+                print(
+                    f"[bootstrap] apt index [{codename}]: "
+                    f"mkvtoolnix {ver_str} → {url}",
+                    flush=True,
+                )
+                return url
+
+            print(
+                f"[bootstrap] mkvtoolnix not found in Packages.gz [{codename}]",
+                flush=True,
+            )
         return None
 
-    def _discover_index_versions() -> list[str]:
+    # ── Step 2: Pure-Python .deb extraction ──────────────────────────────────
+
+    def _ar_extract(ar_bytes: bytes, name_prefix: str) -> bytes | None:
         """
-        Scrape mkvtoolnix.download for tarball filenames.
-        The /linux/ directory index is not publicly listable; try the
-        root and /builds/ pages which may link to current tarballs.
+        Extract the first member whose name starts with `name_prefix` from
+        an ar(1) archive.  The ar format is:
+          - 8-byte magic  "!<arch>\n"
+          - Per member: 60-byte fixed header + data (padded to even length)
         """
-        for url in [
-            "https://mkvtoolnix.download/builds/",
-            "https://mkvtoolnix.download/",
-        ]:
-            try:
-                with urllib.request.urlopen(url, timeout=10) as r:
-                    html = r.read().decode(errors="replace")
-                found = _re.findall(r"mkvtoolnix-64bit-([\d.]+)\.tar\.xz", html)
-                if found:
-                    def _ver_key(v: str):
-                        try:
-                            return tuple(int(x) for x in v.split("."))
-                        except Exception:
-                            return (0,)
-                    vers = sorted(set(found), key=_ver_key, reverse=True)
-                    print(
-                        f"[bootstrap] index scrape found versions: {vers[:5]}",
-                        flush=True,
-                    )
-                    return vers
-            except Exception as exc:
-                print(f"[bootstrap] index scrape {url} failed: {exc}", flush=True)
-        return []
+        MAGIC = b"!<arch>\n"
+        if not ar_bytes.startswith(MAGIC):
+            print("[bootstrap] .deb: bad ar magic", flush=True)
+            return None
+        pos = len(MAGIC)
+        while pos + 60 <= len(ar_bytes):
+            hdr      = ar_bytes[pos : pos + 60]
+            name     = hdr[0:16].rstrip(b" \x00").decode(errors="replace")
+            size_str = hdr[48:58].rstrip(b" \x00")
+            size     = int(size_str) if size_str.strip() else 0
+            pos     += 60
+            member   = ar_bytes[pos : pos + size]
+            pos     += size + (size & 1)   # pad to even
+            if name.rstrip("/").startswith(name_prefix):
+                return member
+        return None
 
-    # Assemble candidate URL list: GitLab API → index scrape → wide static list.
-    # mkvtoolnix.download keeps only the CURRENT release tarball, so dynamic
-    # discovery is essential.  The static list is a last-resort fallback that
-    # covers ~3 years of monthly releases in descending order; update the top
-    # entries whenever the GitLab API also stops working.
-    _STATIC_VERSIONS = [
-        "130.0", "129.0", "128.0", "127.0", "126.0", "125.0", "124.0", "123.0",
-        "122.0", "121.0", "120.0", "119.0", "118.0", "117.0", "116.0", "115.0",
-        "114.0", "113.0", "112.0", "111.0", "110.0", "109.0", "108.0", "107.0",
-        "106.0", "105.0", "104.0", "103.0", "102.0", "101.0", "100.0", "99.0",
-        "98.0", "97.0", "96.0", "95.0", "94.0", "93.0", "92.0", "91.0",
-    ]
-    _BASE = "https://mkvtoolnix.download/linux/mkvtoolnix-64bit-{v}.tar.xz"
+    def _extract_mkvpropedit(deb_bytes: bytes) -> bytes | None:
+        """
+        Pull /usr/bin/mkvpropedit out of a .deb package.
+        A .deb is an ar archive; we find data.tar.* and open it with tarfile.
+        """
+        data_tar = _ar_extract(deb_bytes, "data.tar")
+        if data_tar is None:
+            print("[bootstrap] data.tar not found in .deb ar archive", flush=True)
+            return None
 
-    gitlab_ver   = _gitlab_latest_version()
-    index_vers   = _discover_index_versions()
-
-    _seen: set[str] = set()
-    URLS: list[str] = []
-
-    def _add(v: str) -> None:
-        url = _BASE.format(v=v)
-        if url not in _seen:
-            _seen.add(url)
-            URLS.append(url)
-
-    if gitlab_ver:
-        _add(gitlab_ver)
-    for v in index_vers:
-        _add(v)
-    for v in _STATIC_VERSIONS:
-        _add(v)
-
-    # ── Download loop ────────────────────────────────────────────────────────
-    XZ_MAGIC         = b"\xfd7zXZ\x00"
-    MIN_ARCHIVE_SIZE = 5 * 1024 * 1024   # 5 MB minimum for a real mkvtoolnix tarball
-    CHUNK            = 512 * 1024
-
-    for url in URLS:
-        tmp_name = None
         try:
-            print(f"[bootstrap] Trying mkvtoolnix: {url}", flush=True)
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "worker-bot/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                if resp.status != 200:
-                    print(f"[bootstrap] HTTP {resp.status}, skipping.", flush=True)
-                    continue
-
-                fd, tmp_name = tempfile.mkstemp(suffix=".tar.xz")
-                total = 0
-                with os.fdopen(fd, "wb") as f:
-                    while True:
-                        chunk = resp.read(CHUNK)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        total += len(chunk)
-
-        except urllib.error.HTTPError as exc:
-            print(f"[bootstrap] HTTP {exc.code} for {url}", flush=True)
-            _cleanup(tmp_name)
-            continue
-        except urllib.error.URLError as exc:
-            print(f"[bootstrap] Network error: {exc.reason}", flush=True)
-            _cleanup(tmp_name)
-            time.sleep(2)
-            continue
+            with tarfile.open(fileobj=io.BytesIO(data_tar)) as tar:
+                for member in tar.getmembers():
+                    # normalise ./usr/bin/mkvpropedit → usr/bin/mkvpropedit
+                    norm = member.name.lstrip("./")
+                    if norm == "usr/bin/mkvpropedit" and member.isfile():
+                        fobj = tar.extractfile(member)
+                        if fobj:
+                            data = fobj.read()
+                            print(
+                                f"[bootstrap] Extracted mkvpropedit "
+                                f"({len(data):,} bytes) from data.tar",
+                                flush=True,
+                            )
+                            return data
         except Exception as exc:
-            print(f"[bootstrap] Error: {exc}", flush=True)
-            _cleanup(tmp_name)
-            continue
+            print(f"[bootstrap] tarfile extraction error: {exc}", flush=True)
+        return None
 
-        # ── Validate ─────────────────────────────────────────────────────────
-        if total < MIN_ARCHIVE_SIZE:
+    # ── Main flow ─────────────────────────────────────────────────────────────
+    deb_url = _find_deb_url()
+    if not deb_url:
+        # Non-fatal — fall through to warning below
+        pass
+    else:
+        try:
+            print(f"[bootstrap] Downloading .deb: {deb_url}", flush=True)
+            req = urllib.request.Request(
+                deb_url, headers={"User-Agent": "worker-bot/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                deb_bytes = r.read()
             print(
-                f"[bootstrap] Only {total:,} bytes — likely a 404/error page, skipping.",
+                f"[bootstrap] .deb downloaded ({len(deb_bytes):,} bytes)",
                 flush=True,
             )
-            _cleanup(tmp_name)
-            continue
+        except Exception as exc:
+            print(f"[bootstrap] .deb download failed: {exc}", flush=True)
+            deb_bytes = None
 
-        try:
-            with open(tmp_name, "rb") as f:
-                magic = f.read(6)
-        except Exception:
-            _cleanup(tmp_name)
-            continue
+        if deb_bytes:
+            binary = _extract_mkvpropedit(deb_bytes)
+            if binary:
+                try:
+                    with open(mkvpropedit_path, "wb") as f:
+                        f.write(binary)
+                    os.chmod(mkvpropedit_path, 0o755)
 
-        if magic != XZ_MAGIC:
-            print(f"[bootstrap] Bad magic {magic!r}, skipping.", flush=True)
-            _cleanup(tmp_name)
-            continue
-
-        print(f"[bootstrap] mkvtoolnix downloaded OK ({total:,} bytes)", flush=True)
-
-        # ── Extract mkvpropedit ───────────────────────────────────────────────
-        try:
-            with tarfile.open(tmp_name, "r:xz") as tar:
-                for member in tar.getmembers():
-                    if (
-                        os.path.basename(member.name) == "mkvpropedit"
-                        and member.isfile()
-                    ):
-                        with tar.extractfile(member) as src, \
-                             open(mkvpropedit_path, "wb") as dst:
-                            dst.write(src.read())
-                        os.chmod(mkvpropedit_path, 0o755)
+                    r = subprocess.run(
+                        [mkvpropedit_path, "--version"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if r.returncode == 0:
+                        ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
+                        print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
+                        return  # ← success
+                    else:
                         print(
-                            f"[bootstrap] Extracted mkvpropedit "
-                            f"({os.path.getsize(mkvpropedit_path):,} bytes) "
-                            f"→ {mkvpropedit_path}",
+                            f"[bootstrap] mkvpropedit verification failed "
+                            f"(exit {r.returncode})",
                             flush=True,
                         )
-                        break
-        except Exception as exc:
-            print(f"[bootstrap] Extraction error: {exc}", flush=True)
-            _cleanup(tmp_name)
-            _cleanup(mkvpropedit_path if os.path.exists(mkvpropedit_path) else None)
-            continue
-        finally:
-            _cleanup(tmp_name)
+                        try:
+                            os.unlink(mkvpropedit_path)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    print(f"[bootstrap] write/verify error: {exc}", flush=True)
+            else:
+                print(
+                    "[bootstrap] mkvpropedit binary not found inside .deb",
+                    flush=True,
+                )
 
-        if not os.path.isfile(mkvpropedit_path):
-            print(
-                "[bootstrap] mkvpropedit not found in tarball — "
-                "trying next version.",
-                flush=True,
-            )
-            continue
-
-        # ── Verify ───────────────────────────────────────────────────────────
-        try:
-            r = subprocess.run(
-                [mkvpropedit_path, "--version"], capture_output=True, timeout=10
-            )
-            if r.returncode != 0:
-                raise RuntimeError(f"exit {r.returncode}")
-            ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
-            print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
-            return   # ← success
-        except Exception as exc:
-            print(f"[bootstrap] mkvpropedit failed verification: {exc}", flush=True)
-            _cleanup(mkvpropedit_path)
-            continue
-
-    # Non-fatal: the worker starts without mkvpropedit and uses the FFmpeg
-    # fallback.  Jobs on problematic MKV files will fail metadata embed but
-    # will not crash the worker.
+    # Non-fatal: worker starts and uses FFmpeg fallback for metadata embed.
+    # FFmpeg will fail with exit 183 on MKV files that have broken attachment
+    # streams — this is a known limitation when mkvpropedit is unavailable.
     print(
         "[bootstrap] WARNING: mkvpropedit could not be installed.\n"
         "  Metadata embed for MKV files will use the FFmpeg fallback,\n"
         "  which may fail on files with broken attachment streams (exit 183).\n"
-        "  Fix: ensure one of the static version URLs is reachable, or update\n"
-        "  _STATIC_VERSIONS in worker_bot.py to include the current release.",
+        "  Fix: verify that mkvtoolnix.download/ubuntu is reachable from Heroku\n"
+        "  and that the Packages.gz index lists mkvtoolnix for one of:\n"
+        f"  {CODENAMES}",
         flush=True,
     )
+
 
 
 _bootstrap_mkvtoolnix()
