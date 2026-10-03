@@ -486,112 +486,169 @@ def _bootstrap_mkvtoolnix() -> None:
         return result
 
     # ── Main flow ─────────────────────────────────────────────────────────────
-    # Use 'jammy' (Ubuntu 22.04) to match Heroku-22's libc/libstdc++ ABI.
-    # Fall back to 'noble' (24.04) if jammy is ever removed.
-    CODENAMES = ["jammy", "noble", "oracular", "focal"]
+    #
+    # ROOT CAUSE (confirmed): The MKVToolNix PPA at mkvtoolnix.download/ubuntu
+    # only ships the mkvtoolnix tool itself.  It intentionally does NOT bundle
+    # libebml5 or libmatroska7 — those are standard Ubuntu universe packages
+    # that the PPA assumes are already installed from archive.ubuntu.com.
+    # On a Heroku dyno they are not present, but they ARE in the Ubuntu archive.
+    #
+    # Fix: use TWO separate Packages indexes:
+    #   1. mkvtoolnix.download/ubuntu  → for the mkvtoolnix binary
+    #   2. archive.ubuntu.com/ubuntu   → for libebml5 + libmatroska7
+    #
+    # Both sources use 'jammy' (Ubuntu 22.04) to match Heroku-22's ABI.
+    # We fall back to 'noble' (24.04) if a package is missing from jammy
+    # (e.g. if Ubuntu renames libebml5 → libebml5t64 in a future LTS).
 
-    index_text = None
-    chosen_codename = None
-    for codename in CODENAMES:
-        index_text = _packages_index(codename)
-        if index_text:
-            chosen_codename = codename
-            break
+    CODENAME_PRIMARY  = "jammy"   # Heroku-22 == Ubuntu 22.04
+    CODENAME_FALLBACK = "noble"   # Ubuntu 24.04
 
-    if not index_text:
-        print("[bootstrap] Could not fetch any Packages.gz — giving up.", flush=True)
+    UBUNTU_BASE = "https://archive.ubuntu.com/ubuntu"
+
+    def _ubuntu_packages_index(codename: str, component: str = "universe") -> str | None:
+        """Fetch binary-amd64 Packages.gz from the Ubuntu archive."""
+        url = (
+            f"{UBUNTU_BASE}/dists/{codename}/{component}"
+            f"/binary-amd64/Packages.gz"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "worker-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return gzip.decompress(r.read()).decode(errors="replace")
+        except Exception as exc:
+            print(f"[bootstrap] Ubuntu Packages.gz [{codename}/{component}] failed: {exc}",
+                  flush=True)
+            return None
+
+    # Fetch the MKVToolNix PPA index (for mkvtoolnix binary)
+    ppa_index = _packages_index(CODENAME_PRIMARY)
+    if not ppa_index:
+        ppa_index = _packages_index(CODENAME_FALLBACK)
+    if not ppa_index:
+        print("[bootstrap] Could not fetch MKVToolNix PPA Packages.gz — giving up.", flush=True)
     else:
-        # Packages to fetch: main binary + its two PPA-only shared libs
-        PKGS = {
-            "mkvtoolnix":   lambda p: p == "usr/bin/mkvpropedit",
-            "libebml5":     lambda p: (
-                p.startswith("usr/lib/x86_64-linux-gnu/libebml") and ".so" in p
-            ),
-            "libmatroska7": lambda p: (
-                p.startswith("usr/lib/x86_64-linux-gnu/libmatroska") and ".so" in p
-            ),
-        }
+        # Fetch the Ubuntu archive index (for libebml5 + libmatroska7).
+        # These live in 'universe'; try jammy first, noble as fallback.
+        ubuntu_index = _ubuntu_packages_index(CODENAME_PRIMARY, "universe")
+        if not ubuntu_index:
+            ubuntu_index = _ubuntu_packages_index(CODENAME_FALLBACK, "universe")
+        # Also try 'main' component as a last resort (older Ubuntu kept them there)
+        if not ubuntu_index:
+            ubuntu_index = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
+        if not ubuntu_index:
+            print("[bootstrap] Could not fetch Ubuntu archive Packages.gz — giving up.",
+                  flush=True)
+        else:
+            # Three packages, two sources:
+            #   mkvtoolnix   ← MKVToolNix PPA
+            #   libebml5     ← Ubuntu archive/universe  (try t64 variant too)
+            #   libmatroska7 ← Ubuntu archive/universe  (try t64 variant too)
+            PKGS = [
+                (
+                    "mkvtoolnix",
+                    lambda p: p == "usr/bin/mkvpropedit",
+                    ppa_index,
+                    ["mkvtoolnix"],
+                ),
+                (
+                    "libebml",
+                    lambda p: p.startswith("usr/lib/x86_64-linux-gnu/libebml") and ".so" in p,
+                    ubuntu_index,
+                    ["libebml5", "libebml5t64"],
+                ),
+                (
+                    "libmatroska",
+                    lambda p: p.startswith("usr/lib/x86_64-linux-gnu/libmatroska") and ".so" in p,
+                    ubuntu_index,
+                    ["libmatroska7", "libmatroska7t64"],
+                ),
+            ]
 
-        all_ok = True
-        for pkg_name, path_filter in PKGS.items():
-            info = _find_deb_url(index_text, pkg_name)
-            if not info:
-                print(
-                    f"[bootstrap] {pkg_name} not found in Packages.gz [{chosen_codename}]",
-                    flush=True,
-                )
-                all_ok = False
-                break
-            ver, url = info
-            print(
-                f"[bootstrap] {pkg_name} {ver} [{chosen_codename}]: {url}",
-                flush=True,
-            )
-            deb = _download(url)
-            if not deb:
-                all_ok = False
-                break
+            all_ok = True
+            for slot_name, path_filter, index_to_search, candidates in PKGS:
+                pkg_name = None
+                pkg_info = None
+                for candidate in candidates:
+                    pkg_info = _find_deb_url(index_to_search, candidate)
+                    if pkg_info:
+                        pkg_name = candidate
+                        break
 
-            extracted = _extract_paths(deb, path_filter)
-            if not extracted:
-                print(
-                    f"[bootstrap] No matching files in {pkg_name} .deb",
-                    flush=True,
-                )
-                all_ok = False
-                break
-
-            for norm_path, data in extracted.items():
-                fname = os.path.basename(norm_path)
-                if pkg_name == "mkvtoolnix":
-                    dest = real_bin
-                else:
-                    dest = os.path.join(lib_dir, fname)
-                with open(dest, "wb") as f:
-                    f.write(data)
-                os.chmod(dest, 0o755)
-                print(
-                    f"[bootstrap] Wrote {dest} ({len(data):,} B)",
-                    flush=True,
-                )
-
-        if all_ok and os.path.isfile(real_bin):
-            # Write the shell wrapper that injects LD_LIBRARY_PATH
-            wrapper_src = (
-                "#!/bin/sh\n"
-                f'export LD_LIBRARY_PATH="{lib_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"\n'
-                f'exec "{real_bin}" "$@"\n'
-            )
-            with open(wrapper, "w") as f:
-                f.write(wrapper_src)
-            os.chmod(wrapper, 0o755)
-            print(f"[bootstrap] Wrapper written: {wrapper}", flush=True)
-
-            # Verify
-            try:
-                r = subprocess.run(
-                    [wrapper, "--version"], capture_output=True, timeout=10
-                )
-                if r.returncode == 0:
-                    ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
-                    print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
-                    return   # ← success
-                else:
-                    stderr = r.stderr.decode(errors="replace").strip()
+                if not pkg_info:
                     print(
-                        f"[bootstrap] mkvpropedit verification failed "
-                        f"(exit {r.returncode}): {stderr[:300]}",
+                        f"[bootstrap] {slot_name} not found "
+                        f"(tried: {candidates})",
                         flush=True,
                     )
-            except Exception as exc:
-                print(f"[bootstrap] mkvpropedit verification error: {exc}", flush=True)
+                    all_ok = False
+                    break
 
-            # Clean up broken files
-            for p in (wrapper, real_bin):
+                ver, url = pkg_info
+                print(f"[bootstrap] {pkg_name} {ver}: {url}", flush=True)
+
+                deb = _download(url)
+                if not deb:
+                    all_ok = False
+                    break
+
+                extracted = _extract_paths(deb, path_filter)
+                if not extracted:
+                    print(
+                        f"[bootstrap] No matching files in {pkg_name} .deb",
+                        flush=True,
+                    )
+                    all_ok = False
+                    break
+
+                for norm_path, data in extracted.items():
+                    fname = os.path.basename(norm_path)
+                    if slot_name == "mkvtoolnix":
+                        dest = real_bin
+                    else:
+                        dest = os.path.join(lib_dir, fname)
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                    os.chmod(dest, 0o755)
+                    print(f"[bootstrap] Wrote {dest} ({len(data):,} B)", flush=True)
+
+            if all_ok and os.path.isfile(real_bin):
+                # Write the shell wrapper that injects LD_LIBRARY_PATH
+                wrapper_src = (
+                    "#!/bin/sh\n"
+                    f'export LD_LIBRARY_PATH="{lib_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"\n'
+                    f'exec "{real_bin}" "$@"\n'
+                )
+                with open(wrapper, "w") as f:
+                    f.write(wrapper_src)
+                os.chmod(wrapper, 0o755)
+                print(f"[bootstrap] Wrapper written: {wrapper}", flush=True)
+
+                # Verify
                 try:
-                    os.unlink(p)
-                except Exception:
-                    pass
+                    r = subprocess.run(
+                        [wrapper, "--version"], capture_output=True, timeout=10
+                    )
+                    if r.returncode == 0:
+                        ver = r.stdout.decode(errors="replace").strip().split("\n")[0]
+                        print(f"[bootstrap] mkvpropedit verified: {ver}", flush=True)
+                        return   # ← success
+                    else:
+                        stderr = r.stderr.decode(errors="replace").strip()
+                        print(
+                            f"[bootstrap] mkvpropedit verification failed "
+                            f"(exit {r.returncode}): {stderr[:300]}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(f"[bootstrap] mkvpropedit verification error: {exc}", flush=True)
+
+                # Clean up broken files
+                for p in (wrapper, real_bin):
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
 
     print(
         "[bootstrap] WARNING: mkvpropedit could not be installed.\n"
