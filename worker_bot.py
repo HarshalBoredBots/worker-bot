@@ -621,8 +621,10 @@ def _bootstrap_mkvtoolnix() -> None:
     if not ppa_index:
         print("[bootstrap] Could not fetch MKVToolNix PPA Packages.gz — giving up.", flush=True)
     else:
-        # Fetch the Ubuntu archive index (for libebml5 + libmatroska7).
-        # These live in 'universe'; try jammy first, noble as fallback.
+        # Fetch the Ubuntu archive index for:
+        #   universe — libebml5, libmatroska7
+        #   main     — libboost_filesystem, libboost_system  (mkvpropedit runtime deps)
+        # Try jammy first, noble as fallback for universe.
         ubuntu_index = ubuntu_base = None
         _r = _ubuntu_packages_index(CODENAME_PRIMARY, "universe")
         if _r:
@@ -631,22 +633,39 @@ def _bootstrap_mkvtoolnix() -> None:
             _r = _ubuntu_packages_index(CODENAME_FALLBACK, "universe")
             if _r:
                 ubuntu_index, ubuntu_base = _r
-        # Also try 'main' component as a last resort (older Ubuntu kept them there)
-        if not ubuntu_index:
-            _r = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
+
+        # Fetch the 'main' component index separately — libboost lives there,
+        # not in universe.  We keep it as a separate variable so PKGS entries
+        # can point the right primary_index at each package.
+        ubuntu_main_index = ubuntu_main_base = None
+        _r = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
+        if _r:
+            ubuntu_main_index, ubuntu_main_base = _r
+        if not ubuntu_main_index:
+            _r = _ubuntu_packages_index(CODENAME_FALLBACK, "main")
             if _r:
-                ubuntu_index, ubuntu_base = _r
+                ubuntu_main_index, ubuntu_main_base = _r
+
+        # Merge: if universe failed, fall back to main for everything
+        if not ubuntu_index and ubuntu_main_index:
+            ubuntu_index, ubuntu_base = ubuntu_main_index, ubuntu_main_base
+
         if ubuntu_index is None:
             print(
                 "[bootstrap] Could not fetch Ubuntu archive Packages.gz from any mirror "
-                "— libebml/libmatroska will rely on PPA index only.",
+                "— libebml/libmatroska/libboost will rely on PPA index only.",
                 flush=True,
             )
         if True:  # always attempt download even if ubuntu_index failed
-            # Three packages, two sources:
-            #   mkvtoolnix   ← MKVToolNix PPA
-            #   libebml5     ← Ubuntu archive/universe  (try t64 variant too)
-            #   libmatroska7 ← Ubuntu archive/universe  (try t64 variant too)
+            # Five packages, two sources:
+            #   mkvtoolnix          ← MKVToolNix PPA
+            #   libebml5            ← Ubuntu archive/universe  (try t64 variant too)
+            #   libmatroska7        ← Ubuntu archive/universe  (try t64 variant too)
+            #   libboost-filesystem ← Ubuntu archive/main  (mkvpropedit runtime dep)
+            #   libboost-system     ← Ubuntu archive/main  (mkvpropedit runtime dep)
+            # NOTE: mkvpropedit links against libboost_filesystem.so.1.74.0 and
+            # libboost_system.so.1.74.0.  Without these the binary exits 127
+            # ("cannot open shared object file") and the whole bootstrap fails.
             PKGS = [
                 (
                     "mkvtoolnix",
@@ -666,6 +685,26 @@ def _bootstrap_mkvtoolnix() -> None:
                     ubuntu_index,
                     ["libmatroska7", "libmatroska7t64"],
                 ),
+                (
+                    "libboost-filesystem",
+                    lambda p: (
+                        p.startswith("usr/lib/x86_64-linux-gnu/libboost_filesystem")
+                        and ".so" in p
+                    ),
+                    ubuntu_main_index or ubuntu_index,
+                    ["libboost-filesystem1.74.0", "libboost-filesystem1.74-dev",
+                     "libboost-filesystem1.83.0", "libboost-filesystem1.83-dev"],
+                ),
+                (
+                    "libboost-system",
+                    lambda p: (
+                        p.startswith("usr/lib/x86_64-linux-gnu/libboost_system")
+                        and ".so" in p
+                    ),
+                    ubuntu_main_index or ubuntu_index,
+                    ["libboost-system1.74.0", "libboost-system1.74-dev",
+                     "libboost-system1.83.0", "libboost-system1.83-dev"],
+                ),
             ]
 
             # Build a combined (index, base_url) search list.
@@ -673,13 +712,18 @@ def _bootstrap_mkvtoolnix() -> None:
             # builds correct absolute .deb URLs (PPA vs Ubuntu archive differ).
             # ubuntu_index may be None if all archive mirrors failed; filter it out.
             all_index_sources: list[tuple[str, str]] = [
-                s for s in [(ppa_index, BASE), (ubuntu_index, ubuntu_base)]
+                s for s in [
+                    (ppa_index, BASE),
+                    (ubuntu_index, ubuntu_base),
+                    (ubuntu_main_index, ubuntu_main_base),
+                ]
                 if s[0] is not None
             ]
             print(
                 f"[bootstrap] Index sources available: "
                 f"ppa={'yes' if ppa_index else 'no'}  "
-                f"ubuntu={'yes (base=' + ubuntu_base + ')' if ubuntu_index else 'NO — archive mirrors unreachable'}",
+                f"ubuntu={'yes (base=' + ubuntu_base + ')' if ubuntu_index else 'NO — archive mirrors unreachable'}  "
+                f"ubuntu-main={'yes (base=' + ubuntu_main_base + ')' if ubuntu_main_index else 'NO'}",
                 flush=True,
             )
 
@@ -691,7 +735,12 @@ def _bootstrap_mkvtoolnix() -> None:
                 to_try: list[tuple[str, str, str]] = []
                 seen_urls: set[str] = set()
                 # primary_index may be None (e.g. ubuntu_index failed); find its base.
-                primary_base = BASE if primary_index is ppa_index else ubuntu_base
+                if primary_index is ppa_index:
+                    primary_base = BASE
+                elif primary_index is ubuntu_main_index:
+                    primary_base = ubuntu_main_base
+                else:
+                    primary_base = ubuntu_base
                 primary_pair = (primary_index, primary_base) if primary_index is not None else None
                 others = [s for s in all_index_sources if s[0] is not primary_index]
                 ordered_sources = ([primary_pair] if primary_pair else []) + others
