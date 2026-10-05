@@ -2,7 +2,7 @@
 
 A distributed Telegram file-rename worker bot that downloads media, injects metadata using FFmpeg/mkvpropedit, and re-uploads to an output channel. Designed to run as one of many parallel worker instances under a central coordinator.
 
-> **Author:** [@naruto0927](https://t.me/naruto0927)
+> **Authors:** [@Lance_Arthur](https://t.me/Lance_Arthur) · [@naruto0927](https://t.me/naruto0927)
 
 ---
 
