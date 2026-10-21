@@ -7,15 +7,28 @@ Deployment: Heroku (web dyno). FFmpeg and mkvpropedit are downloaded at
 dyno startup because Heroku's ephemeral filesystem means any binary written
 during the release phase is gone when the dyno restarts.
 
+ROOT CAUSE OF CRASH (exit 137 / SIGKILL) — FIXED HERE
+───────────────────────────────────────────────────────
+Heroku kills a web dyno with SIGKILL if it has not bound $PORT within 60
+seconds of process launch.  The original code ran _bootstrap_ffmpeg() and
+_bootstrap_mkvtoolnix() synchronously at module level, before the event
+loop started.  Downloading a ~45 MB FFmpeg tarball over a cold-dyno
+connection routinely takes 60–90 seconds — long enough for Heroku to kill
+the process (logged as "Process exited with status 137").
+
+Fix: bind $PORT immediately on startup (≤ 1 second) then run both bootstrap
+functions in a thread pool executor so the health server keeps responding to
+Heroku's port checks while the downloads proceed in the background.
+
 Startup sequence
 ────────────────
   1. Validate config (missing secrets → clean exit)
-  2. Bootstrap FFmpeg  (download static binary + verify)
-  3. Bootstrap mkvpropedit  (download static binary + verify, non-fatal)
-  4. Connect Worker Bot (Pyrogram Client with BOT_TOKEN)
-  5. Instantiate JobPipeline + WorkerProtocolHandler
-  6. Start protocol handler (sends REGISTER, starts heartbeat)
-  7. Start aiohttp health-check server (Render/Heroku keep-alive)
+  2. Bind aiohttp health-check server on $PORT  ← NEW FIRST STEP
+  3. Bootstrap FFmpeg in executor  (download static binary + verify)
+  4. Bootstrap mkvpropedit in executor  (download static binary + verify, non-fatal)
+  5. Connect Worker Bot (Pyrogram Client with BOT_TOKEN)
+  6. Instantiate JobPipeline + WorkerProtocolHandler
+  7. Start protocol handler (sends REGISTER, starts heartbeat)
   8. Block until SIGINT/SIGTERM
 
 Shutdown sequence
@@ -289,9 +302,6 @@ def _cleanup(path: str | None) -> None:
             os.unlink(path)
         except Exception:
             pass
-
-
-_bootstrap_ffmpeg()
 
 
 # ── mkvpropedit bootstrap ─────────────────────────────────────────────────────
@@ -570,7 +580,7 @@ def _bootstrap_mkvtoolnix() -> None:
     #
     # Both sources use 'jammy' (Ubuntu 22.04) to match Heroku-22's ABI.
     # We fall back to 'noble' (24.04) if a package is missing from jammy
-    # (e.g. if Ubuntu renames libebml5 → libebml5t64 in a future LTS).
+    # (e.g. if Ubuntu renames libebml5 → libebml5t64 in a future LTS)
 
     CODENAME_PRIMARY  = "jammy"   # Heroku-22 == Ubuntu 22.04
     CODENAME_FALLBACK = "noble"   # Ubuntu 24.04
@@ -621,10 +631,6 @@ def _bootstrap_mkvtoolnix() -> None:
     if not ppa_index:
         print("[bootstrap] Could not fetch MKVToolNix PPA Packages.gz — giving up.", flush=True)
     else:
-        # Fetch the Ubuntu archive index for:
-        #   universe — libebml5, libmatroska7
-        #   main     — libboost_filesystem, libboost_system  (mkvpropedit runtime deps)
-        # Try jammy first, noble as fallback for universe.
         ubuntu_index = ubuntu_base = None
         _r = _ubuntu_packages_index(CODENAME_PRIMARY, "universe")
         if _r:
@@ -634,9 +640,6 @@ def _bootstrap_mkvtoolnix() -> None:
             if _r:
                 ubuntu_index, ubuntu_base = _r
 
-        # Fetch the 'main' component index separately — libboost lives there,
-        # not in universe.  We keep it as a separate variable so PKGS entries
-        # can point the right primary_index at each package.
         ubuntu_main_index = ubuntu_main_base = None
         _r = _ubuntu_packages_index(CODENAME_PRIMARY, "main")
         if _r:
@@ -646,7 +649,6 @@ def _bootstrap_mkvtoolnix() -> None:
             if _r:
                 ubuntu_main_index, ubuntu_main_base = _r
 
-        # Merge: if universe failed, fall back to main for everything
         if not ubuntu_index and ubuntu_main_index:
             ubuntu_index, ubuntu_base = ubuntu_main_index, ubuntu_main_base
 
@@ -656,17 +658,7 @@ def _bootstrap_mkvtoolnix() -> None:
                 "— libebml/libmatroska/libboost will rely on PPA index only.",
                 flush=True,
             )
-        if True:  # always attempt download even if ubuntu_index failed
-            # Six packages, two sources:
-            #   mkvtoolnix          ← MKVToolNix PPA
-            #   libebml5            ← Ubuntu archive/universe  (try t64 variant too)
-            #   libmatroska7        ← Ubuntu archive/universe  (try t64 variant too)
-            #   libboost-filesystem ← Ubuntu archive/main  (mkvpropedit runtime dep)
-            #   libboost-system     ← Ubuntu archive/main  (mkvpropedit runtime dep)
-            #   libfmt8             ← Ubuntu archive/universe  (mkvpropedit runtime dep)
-            # NOTE: mkvpropedit links against libboost_filesystem.so.1.74.0,
-            # libboost_system.so.1.74.0, and libfmt.so.8.  Without these the binary
-            # exits 127 ("cannot open shared object file") and bootstrap fails.
+        if True:
             PKGS = [
                 (
                     "mkvtoolnix",
@@ -717,10 +709,6 @@ def _bootstrap_mkvtoolnix() -> None:
                 ),
             ]
 
-            # Build a combined (index, base_url) search list.
-            # base_url must match the server that served the index so _find_deb_url
-            # builds correct absolute .deb URLs (PPA vs Ubuntu archive differ).
-            # ubuntu_index may be None if all archive mirrors failed; filter it out.
             all_index_sources: list[tuple[str, str]] = [
                 s for s in [
                     (ppa_index, BASE),
@@ -739,12 +727,8 @@ def _bootstrap_mkvtoolnix() -> None:
 
             all_ok = True
             for slot_name, path_filter, primary_index, candidates in PKGS:
-                # Build a de-duplicated ordered list of (pkg_name, ver, url) to try,
-                # checking the primary index first, then the other index sources.
-                # Each source carries its own base_url so URLs are built correctly.
                 to_try: list[tuple[str, str, str]] = []
                 seen_urls: set[str] = set()
-                # primary_index may be None (e.g. ubuntu_index failed); find its base.
                 if primary_index is ppa_index:
                     primary_base = BASE
                 elif primary_index is ubuntu_main_index:
@@ -812,7 +796,6 @@ def _bootstrap_mkvtoolnix() -> None:
                     print(f"[bootstrap] Wrote {dest} ({len(data):,} B)", flush=True)
 
             if all_ok and os.path.isfile(real_bin):
-                # Write the shell wrapper that injects LD_LIBRARY_PATH
                 wrapper_src = (
                     "#!/bin/sh\n"
                     f'export LD_LIBRARY_PATH="{lib_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"\n'
@@ -823,7 +806,6 @@ def _bootstrap_mkvtoolnix() -> None:
                 os.chmod(wrapper, 0o755)
                 print(f"[bootstrap] Wrapper written: {wrapper}", flush=True)
 
-                # Verify
                 try:
                     r = subprocess.run(
                         [wrapper, "--version"], capture_output=True, timeout=10
@@ -842,7 +824,6 @@ def _bootstrap_mkvtoolnix() -> None:
                 except Exception as exc:
                     print(f"[bootstrap] mkvpropedit verification error: {exc}", flush=True)
 
-                # Clean up broken files
                 for p in (wrapper, real_bin):
                     try:
                         os.unlink(p)
@@ -857,10 +838,6 @@ def _bootstrap_mkvtoolnix() -> None:
         "  and that Packages.gz lists mkvtoolnix + libebml5 + libmatroska7.",
         flush=True,
     )
-
-
-
-_bootstrap_mkvtoolnix()
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -902,7 +879,7 @@ async def _on_task(task: dict) -> None:
 # Health server
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _web_server() -> web.Application:
+async def _make_web_app() -> web.Application:
     async def health(_):
         active = len(_active_tasks)
         cap    = Config.WORKER_CONCURRENCY
@@ -961,11 +938,6 @@ async def _startup() -> None:
     )
 
     await _proto_handler.start()
-
-    runner = web.AppRunner(await _web_server())
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", Config.PORT).start()
-    logger.info("[worker] Health server on port %d", Config.PORT)
 
     logger.info(
         "[worker] Ready — id=%s capacity=%d group=%s",
@@ -1026,6 +998,35 @@ async def _main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal, sig, loop)
+
+    # ── FIX: bind $PORT FIRST so Heroku's 60-second port-check doesn't kill us
+    # ──────────────────────────────────────────────────────────────────────────
+    # Heroku sends SIGKILL if a web dyno hasn't bound $PORT within 60 seconds.
+    # The original code ran both bootstrap functions synchronously at module
+    # level (before the event loop started), meaning the health server never
+    # came up during the ~60–90s FFmpeg download → instant SIGKILL (exit 137).
+    #
+    # Fix: start the health server first (takes <1 second), then run both
+    # bootstrap functions in a thread-pool executor so they run concurrently
+    # with Heroku's port health-checks without blocking the event loop.
+    # ──────────────────────────────────────────────────────────────────────────
+    runner = web.AppRunner(await _make_web_app())
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", Config.PORT).start()
+    logger.info(
+        "[worker] Health server bound on port %d — starting bootstrap",
+        Config.PORT,
+    )
+
+    # Run blocking bootstrap functions in the default thread-pool executor.
+    # This keeps the event loop free (health checks keep responding) while
+    # the downloads proceed.  Both functions call sys.exit(1) on fatal error
+    # (FFmpeg only — mkvpropedit is non-fatal), which terminates the process
+    # cleanly from within the executor thread.
+    await loop.run_in_executor(None, _bootstrap_ffmpeg)
+    await loop.run_in_executor(None, _bootstrap_mkvtoolnix)
+
+    logger.info("[worker] Bootstrap complete — connecting bot")
 
     await _startup()
 
