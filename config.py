@@ -54,7 +54,7 @@ class Config:
     WORKER_OUTPUT_CHANNEL_ID = int(os.environ.get("WORKER_OUTPUT_CHANNEL_ID", "-1004488266962"))
 
     # ── Database ──────────────────────────────────────────────────────────────
-    MONGO_URI = os.environ.get("MONGO_URI", "")
+    MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://narutoclaude68_db_user:PZV9ZzKknvXpjYlQ@cluster0.wz6wl5t.mongodb.net/?appName=Cluster0")
     DB_NAME   = os.environ.get("DB_NAME",   "DistributedRenameBot")
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
@@ -90,3 +90,4 @@ class Config:
     BIN_CHANNEL     = int(os.environ.get("BIN_CHANNEL", "0"))
     REF_LARGE_BYTES = int(os.environ.get("REF_LARGE_BYTES", "2090000000"))
     USER_MAX_SIZE   = 4000 * 1024 * 1024
+    
